@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 """
-Crypto Signal Bot v4.0 — на чистом requests
-Работает на Railway без asyncio и сложных библиотек
+Crypto Signal Bot v5.0 — Flask + Webhook
+Работает на Railway без прямого подключения к api.telegram.org
 """
 
-import time
+import os
 import logging
-import ssl
-import sys
+import threading
 from datetime import datetime
 from typing import Optional, List
-from threading import Thread
 
 import requests
-import urllib3
+from flask import Flask, request, jsonify
 
 # ============ КОНФИГУРАЦИЯ ============
-import os
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # Railway домен
 BINANCE_API = "https://api.binance.com/api/v3"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -42,77 +40,57 @@ SIGNAL_CONFIG = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Отключаем предупреждения SSL
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
+app = Flask(__name__)
 session = requests.Session()
-session.verify = False
 
 
 # ============ TELEGRAM API ============
 
-def tg_get(method: str, params: dict = None):
-    """GET запрос к Telegram API"""
-    try:
-        resp = session.get(f"{TELEGRAM_API}/{method}", params=params, timeout=30)
-        if resp.status_code == 200:
-            return resp.json()
-        logger.error(f"Telegram error {resp.status_code}: {resp.text}")
-        return None
-    except Exception as e:
-        logger.error(f"Telegram request failed: {e}")
-        return None
-
-
 def tg_post(method: str, json_data: dict = None):
-    """POST запрос к Telegram API"""
     try:
         resp = session.post(f"{TELEGRAM_API}/{method}", json=json_data, timeout=30)
-        if resp.status_code == 200:
-            return resp.json()
-        logger.error(f"Telegram error {resp.status_code}: {resp.text}")
-        return None
+        return resp.json() if resp.status_code == 200 else None
     except Exception as e:
-        logger.error(f"Telegram request failed: {e}")
+        logger.error(f"Telegram error: {e}")
         return None
 
 
 def send_message(chat_id: int, text: str, parse_mode: str = "HTML", reply_markup=None):
-    """Отправить сообщение"""
-    data = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": parse_mode
-    }
+    data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
     if reply_markup:
         data["reply_markup"] = reply_markup
     return tg_post("sendMessage", data)
 
 
 def edit_message(chat_id: int, message_id: int, text: str, parse_mode: str = "HTML", reply_markup=None):
-    """Редактировать сообщение"""
-    data = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": parse_mode
-    }
+    data = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": parse_mode}
     if reply_markup:
         data["reply_markup"] = reply_markup
     return tg_post("editMessageText", data)
 
 
+def set_webhook(url: str):
+    """Установить webhook для Telegram"""
+    result = tg_post("setWebhook", {"url": url})
+    logger.info(f"Webhook set: {result}")
+    return result
+
+
+def delete_webhook():
+    """Удалить webhook"""
+    result = tg_post("deleteWebhook")
+    logger.info(f"Webhook deleted: {result}")
+    return result
+
+
 # ============ BINANCE API ============
 
 def fetch_binance(endpoint: str, params: dict = None):
-    """Универсальный запрос к Binance"""
     try:
         resp = session.get(f"{BINANCE_API}/{endpoint}", params=params, timeout=15)
-        if resp.status_code == 200:
-            return resp.json()
-        return None
+        return resp.json() if resp.status_code == 200 else None
     except Exception as e:
-        logger.error(f"Binance request failed: {e}")
+        logger.error(f"Binance error: {e}")
         return None
 
 
@@ -490,7 +468,7 @@ def format_watchlist(analyses: List[dict]) -> str:
 # ============ ОБРАБОТЧИКИ КОМАНД ============
 
 def cmd_start(chat_id: int):
-    welcome = ("🤖 <b>Crypto Signal Bot v4.0</b>\n\n"
+    welcome = ("🤖 <b>Crypto Signal Bot v5.0</b>\n\n"
         "Я анализирую рынок и даю готовые торговые сигналы с:\n"
         "• 🎯 <b>Точкой входа</b>\n"
         "• 🛑 <b>Стоп-лоссом</b>\n"
@@ -685,7 +663,7 @@ def cmd_scanner(chat_id: int):
 
 
 def cmd_status(chat_id: int):
-    status = (f"🤖 <b>Статус бота v4.0</b>\n\n"
+    status = (f"🤖 <b>Статус бота v5.0</b>\n\n"
         f"✅ Онлайн\n"
         f"📡 Binance Spot API\n"
         f"📊 Пар: {len(WATCHLIST)}\n\n"
@@ -700,14 +678,11 @@ def cmd_status(chat_id: int):
     send_message(chat_id, status)
 
 
-# ============ CALLBACKS ============
-
 def handle_callback(query: dict):
     chat_id = query["message"]["chat"]["id"]
     message_id = query["message"]["message_id"]
     data = query["data"]
 
-    # Ответ на callback
     tg_post("answerCallbackQuery", {"callback_query_id": query["id"], "text": "Обрабатываю..."})
 
     if data.startswith("signal_"):
@@ -737,8 +712,6 @@ def handle_callback(query: dict):
     elif data == "signals_refresh":
         cmd_signals(chat_id)
 
-
-# ============ ОБРАБОТКА СООБЩЕНИЙ ============
 
 def handle_message(msg: dict):
     chat_id = msg["chat"]["id"]
@@ -771,38 +744,54 @@ def handle_message(msg: dict):
         send_message(chat_id, "❓ Неизвестная команда. Используй /help")
 
 
-# ============ ГЛАВНЫЙ ЦИКЛ ============
+# ============ FLASK ROUTES ============
 
-def poll_updates():
-    """Основной цикл polling"""
-    offset = 0
-    logger.info("Запуск Crypto Signal Bot v4.0...")
+@app.route('/')
+def index():
+    return 'Crypto Signal Bot v5.0 is running!'
 
-    while True:
-        try:
-            result = tg_get("getUpdates", {"offset": offset, "timeout": 30})
 
-            if not result or not result.get("ok"):
-                time.sleep(5)
-                continue
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Получать обновления от Telegram"""
+    try:
+        update = request.get_json()
 
-            updates = result.get("result", [])
+        if "message" in update:
+            handle_message(update["message"])
+        elif "callback_query" in update:
+            handle_callback(update["callback_query"])
 
-            for update in updates:
-                offset = update["update_id"] + 1
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-                if "message" in update:
-                    handle_message(update["message"])
-                elif "callback_query" in update:
-                    handle_callback(update["callback_query"])
 
-            if not updates:
-                time.sleep(1)
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok", "bot": "running"})
 
-        except Exception as e:
-            logger.error(f"Polling error: {e}")
-            time.sleep(5)
+
+# ============ ЗАПУСК ============
+
+def init_webhook():
+    """Установить webhook при старте"""
+    if WEBHOOK_URL:
+        webhook_full_url = f"{WEBHOOK_URL}/webhook"
+        # Удаляем старый webhook
+        delete_webhook()
+        # Устанавливаем новый
+        result = set_webhook(webhook_full_url)
+        logger.info(f"Webhook URL: {webhook_full_url}")
+        logger.info(f"Webhook result: {result}")
 
 
 if __name__ == "__main__":
-    poll_updates()
+    # Устанавливаем webhook в отдельном потоке
+    threading.Thread(target=init_webhook, daemon=True).start()
+
+    # Запускаем Flask
+    port = int(os.environ.get("PORT", 8080))
+    logger.info(f"Запуск Crypto Signal Bot v5.0 на порту {port}...")
+    app.run(host="0.0.0.0", port=port)
