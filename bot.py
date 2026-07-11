@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
 """
-Crypto Signal Bot v3.0 — на python-telegram-bot
-Работает на Railway без pydantic
+Crypto Signal Bot v4.0 — на чистом requests
+Работает на Railway без asyncio и сложных библиотек
 """
 
-import asyncio
+import time
 import logging
 import ssl
 import sys
 from datetime import datetime
 from typing import Optional, List
+from threading import Thread
 
-import aiohttp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-
-# ============ WINDOWS FIX ============
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+import requests
+import urllib3
 
 # ============ КОНФИГУРАЦИЯ ============
 import os
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 BINANCE_API = "https://api.binance.com/api/v3"
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 WATCHLIST = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
@@ -45,40 +42,91 @@ SIGNAL_CONFIG = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-ssl_context = ssl.create_default_context()
-ssl_context.set_ciphers('DEFAULT@SECLEVEL=1')
+# Отключаем предупреждения SSL
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+session = requests.Session()
+session.verify = False
+
+
+# ============ TELEGRAM API ============
+
+def tg_get(method: str, params: dict = None):
+    """GET запрос к Telegram API"""
+    try:
+        resp = session.get(f"{TELEGRAM_API}/{method}", params=params, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+        logger.error(f"Telegram error {resp.status_code}: {resp.text}")
+        return None
+    except Exception as e:
+        logger.error(f"Telegram request failed: {e}")
+        return None
+
+
+def tg_post(method: str, json_data: dict = None):
+    """POST запрос к Telegram API"""
+    try:
+        resp = session.post(f"{TELEGRAM_API}/{method}", json=json_data, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+        logger.error(f"Telegram error {resp.status_code}: {resp.text}")
+        return None
+    except Exception as e:
+        logger.error(f"Telegram request failed: {e}")
+        return None
+
+
+def send_message(chat_id: int, text: str, parse_mode: str = "HTML", reply_markup=None):
+    """Отправить сообщение"""
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode
+    }
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+    return tg_post("sendMessage", data)
+
+
+def edit_message(chat_id: int, message_id: int, text: str, parse_mode: str = "HTML", reply_markup=None):
+    """Редактировать сообщение"""
+    data = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode
+    }
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+    return tg_post("editMessageText", data)
 
 
 # ============ BINANCE API ============
 
-async def fetch_binance(endpoint: str, params: dict = None):
-    connector = aiohttp.TCPConnector(ssl=ssl_context, limit=10)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        try:
-            async with session.get(
-                f"{BINANCE_API}/{endpoint}", 
-                params=params, 
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                return None
-        except Exception as e:
-            logger.error(f"Request failed: {e}")
-            return None
+def fetch_binance(endpoint: str, params: dict = None):
+    """Универсальный запрос к Binance"""
+    try:
+        resp = session.get(f"{BINANCE_API}/{endpoint}", params=params, timeout=15)
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception as e:
+        logger.error(f"Binance request failed: {e}")
+        return None
 
 
-async def get_ticker_24h(symbol: str):
-    return await fetch_binance("ticker/24hr", {"symbol": symbol})
+def get_ticker_24h(symbol: str):
+    return fetch_binance("ticker/24hr", {"symbol": symbol})
 
 
-async def get_klines(symbol: str, interval: str = "1h", limit: int = 200):
-    data = await fetch_binance("klines", {"symbol": symbol, "interval": interval, "limit": limit})
+def get_klines(symbol: str, interval: str = "1h", limit: int = 200):
+    data = fetch_binance("klines", {"symbol": symbol, "interval": interval, "limit": limit})
     return data or []
 
 
-async def get_all_tickers():
-    return await fetch_binance("ticker/24hr") or []
+def get_all_tickers():
+    return fetch_binance("ticker/24hr") or []
 
 
 # ============ ТЕХНИЧЕСКИЙ АНАЛИЗ ============
@@ -201,12 +249,10 @@ def calculate_levels(signal: str, entry: float, atr: float, support: float, resi
 
 # ============ ОСНОВНОЙ АНАЛИЗ ============
 
-async def analyze_symbol(symbol: str) -> Optional[dict]:
-    ticker_task = get_ticker_24h(symbol)
-    klines_1h = get_klines(symbol, "1h", 200)
-    klines_4h = get_klines(symbol, "4h", 100)
-
-    ticker, k1h, k4h = await asyncio.gather(ticker_task, klines_1h, klines_4h)
+def analyze_symbol(symbol: str) -> Optional[dict]:
+    ticker = get_ticker_24h(symbol)
+    k1h = get_klines(symbol, "1h", 200)
+    k4h = get_klines(symbol, "4h", 100)
 
     if not ticker or not k1h or len(k1h) < 50:
         return None
@@ -443,8 +489,8 @@ def format_watchlist(analyses: List[dict]) -> str:
 
 # ============ ОБРАБОТЧИКИ КОМАНД ============
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome = ("🤖 <b>Crypto Signal Bot v3.0</b>\n\n"
+def cmd_start(chat_id: int):
+    welcome = ("🤖 <b>Crypto Signal Bot v4.0</b>\n\n"
         "Я анализирую рынок и даю готовые торговые сигналы с:\n"
         "• 🎯 <b>Точкой входа</b>\n"
         "• 🛑 <b>Стоп-лоссом</b>\n"
@@ -459,15 +505,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — Справка\n\n"
         "⚠️ <i>Не финансовый совет. Управляй рисками!</i>")
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📈 Сигнал BTC", callback_data="signal_BTC")],
-        [InlineKeyboardButton("📊 Обзор рынка", callback_data="watchlist")],
-        [InlineKeyboardButton("🔍 Сканер", callback_data="scanner")]
-    ])
-    await update.message.reply_html(welcome, reply_markup=kb)
+    kb = {
+        "inline_keyboard": [
+            [{"text": "📈 Сигнал BTC", "callback_data": "signal_BTC"}],
+            [{"text": "📊 Обзор рынка", "callback_data": "watchlist"}],
+            [{"text": "🔍 Сканер", "callback_data": "scanner"}]
+        ]
+    }
+    send_message(chat_id, welcome, reply_markup=kb)
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def cmd_help(chat_id: int):
     help_text = ("<b>📚 Справка</b>\n\n"
         "<b>/signal [монета]</b> — Детальный сигнал с уровнями\n"
         "  Пример: /signal BTC, /signal ETH\n\n"
@@ -485,44 +533,47 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Стоп всегда ставить!\n"
         "• 50% закрывать на TP1, стоп в БУ\n"
         "• Не рисковать >2% депозита на сделку")
-    await update.message.reply_html(help_text)
+    send_message(chat_id, help_text)
 
 
-async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
+def cmd_signal(chat_id: int, args: list):
     symbol = (args[0].upper() + "USDT") if args else "BTCUSDT"
 
     if symbol not in WATCHLIST and symbol != "BTCUSDT":
-        await update.message.reply_text(f"❌ {symbol} не в списке. Используй /watchlist")
+        send_message(chat_id, f"❌ {symbol} не в списке. Используй /watchlist")
         return
 
-    wait = await update.message.reply_text(f"🔍 Анализ {symbol.replace('USDT','')}/USDT...")
+    msg = send_message(chat_id, f"🔍 Анализ {symbol.replace('USDT','')}/USDT...")
 
-    a = await analyze_symbol(symbol)
+    a = analyze_symbol(symbol)
     if not a:
-        await wait.edit_text("❌ Не удалось получить данные")
+        edit_message(chat_id, msg["result"]["message_id"], "❌ Не удалось получить данные")
         return
 
     text = format_signal(a)
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Обновить", callback_data=f"signal_{a['symbol']}")],
-        [InlineKeyboardButton("📊 Binance", url=f"https://www.binance.com/ru/trade/{a['symbol']}_USDT")]
-    ])
+    kb = {
+        "inline_keyboard": [
+            [{"text": "🔄 Обновить", "callback_data": f"signal_{a['symbol']}"}],
+            [{"text": "📊 Binance", "url": f"https://www.binance.com/ru/trade/{a['symbol']}_USDT"}]
+        ]
+    }
+    edit_message(chat_id, msg["result"]["message_id"], text, reply_markup=kb)
 
-    await wait.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
+def cmd_signals(chat_id: int):
+    msg = send_message(chat_id, "🔍 Ищу сигналы...")
 
-async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    wait = await update.message.reply_text("🔍 Ищу сигналы...")
+    analyses = []
+    for s in WATCHLIST:
+        a = analyze_symbol(s)
+        if a and a["signal"] in ["BUY", "SELL"]:
+            analyses.append(a)
 
-    tasks = [analyze_symbol(s) for s in WATCHLIST]
-    results = await asyncio.gather(*tasks)
-    analyses = [r for r in results if r and r["signal"] in ["BUY", "SELL"]]
     analyses.sort(key=lambda x: x["signal_strength"], reverse=True)
 
     if not analyses:
-        await wait.edit_text("⚪ Нет сильных сигналов. Рынок в боковике.")
+        edit_message(chat_id, msg["result"]["message_id"], "⚪ Нет сильных сигналов. Рынок в боковике.")
         return
 
     lines = [f"🎯 <b>АКТИВНЫЕ СИГНАЛЫ ({len(analyses)})</b>", ""]
@@ -541,36 +592,33 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"   RSI: {a['rsi_1h']} | 24ч: {a['price_change_24h']:+.1f}%")
         lines.append("")
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Обновить", callback_data="signals_refresh")]
-    ])
-
-    await wait.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+    kb = {"inline_keyboard": [[{"text": "🔄 Обновить", "callback_data": "signals_refresh"}]]}
+    edit_message(chat_id, msg["result"]["message_id"], "\n".join(lines), reply_markup=kb)
 
 
-async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    wait = await update.message.reply_text("📊 Загружаю рынок...")
+def cmd_watchlist(chat_id: int):
+    msg = send_message(chat_id, "📊 Загружаю рынок...")
 
-    tasks = [analyze_symbol(s) for s in WATCHLIST]
-    results = await asyncio.gather(*tasks)
-    analyses = [r for r in results if r]
+    analyses = []
+    for s in WATCHLIST:
+        a = analyze_symbol(s)
+        if a:
+            analyses.append(a)
+
     analyses.sort(key=lambda x: x["quote_volume_24h"], reverse=True)
 
     text = format_watchlist(analyses)
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Обновить", callback_data="watchlist")]
-    ])
-
-    await wait.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    kb = {"inline_keyboard": [[{"text": "🔄 Обновить", "callback_data": "watchlist"}]]}
+    edit_message(chat_id, msg["result"]["message_id"], text, reply_markup=kb)
 
 
-async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    wait = await update.message.reply_text("🔝 Ищу топ...")
+def cmd_top(chat_id: int):
+    msg = send_message(chat_id, "🔝 Ищу топ...")
 
-    tickers = await get_all_tickers()
+    tickers = get_all_tickers()
     if not tickers:
-        await wait.edit_text("❌ Ошибка")
+        edit_message(chat_id, msg["result"]["message_id"], "❌ Ошибка")
         return
 
     usdt = [t for t in tickers if t["symbol"].endswith("USDT") and float(t["quoteVolume"]) > 1e6]
@@ -589,18 +637,21 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"   ${price:,.4f} | {change:+.2f}% | Объём: ${vol/1e6:.1f}M")
         lines.append("")
 
-    await wait.edit_text("\n".join(lines), parse_mode="HTML")
+    edit_message(chat_id, msg["result"]["message_id"], "\n".join(lines))
 
 
-async def cmd_scanner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    wait = await update.message.reply_text("🔍 Сканирую рынок на лучшие сигналы...\nЭто может занять 10-15 секунд...")
+def cmd_scanner(chat_id: int):
+    msg = send_message(chat_id, "🔍 Сканирую рынок на лучшие сигналы...\nЭто может занять 10-15 секунд...")
 
-    tasks = [analyze_symbol(s) for s in WATCHLIST]
-    results = await asyncio.gather(*tasks)
+    results = []
+    for s in WATCHLIST:
+        a = analyze_symbol(s)
+        if a:
+            results.append(a)
 
     good_signals = []
     for r in results:
-        if r and r["signal"] == "BUY":
+        if r["signal"] == "BUY":
             levels = r.get("levels", {})
             rr = levels.get("risk_reward_1", 0)
             if rr >= 2.0 and r["signal_strength"] >= 3:
@@ -609,7 +660,7 @@ async def cmd_scanner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     good_signals.sort(key=lambda x: (x.get("levels", {}).get("risk_reward_1", 0), x["signal_strength"]), reverse=True)
 
     if not good_signals:
-        await wait.edit_text("⚪ Нет качественных сигналов с R:R >= 2.0. Попробуй позже.")
+        edit_message(chat_id, msg["result"]["message_id"], "⚪ Нет качественных сигналов с R:R >= 2.0. Попробуй позже.")
         return
 
     lines = [f"🔍 <b>ЛУЧШИЕ СИГНАЛЫ (R:R >= 2.0)</b>", f"Найдено: {len(good_signals)} сигналов", ""]
@@ -624,16 +675,17 @@ async def cmd_scanner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"   RSI: {a['rsi_1h']} | Объём: x{a['volume_spike']}")
         lines.append("")
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Пересканировать", callback_data="scanner")],
-        [InlineKeyboardButton("📈 Сигнал BTC", callback_data="signal_BTC")]
-    ])
+    kb = {
+        "inline_keyboard": [
+            [{"text": "🔄 Пересканировать", "callback_data": "scanner"}],
+            [{"text": "📈 Сигнал BTC", "callback_data": "signal_BTC"}]
+        ]
+    }
+    edit_message(chat_id, msg["result"]["message_id"], "\n".join(lines), reply_markup=kb)
 
-    await wait.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
 
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = (f"🤖 <b>Статус бота v3.0</b>\n\n"
+def cmd_status(chat_id: int):
+    status = (f"🤖 <b>Статус бота v4.0</b>\n\n"
         f"✅ Онлайн\n"
         f"📡 Binance Spot API\n"
         f"📊 Пар: {len(WATCHLIST)}\n\n"
@@ -645,92 +697,112 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• TP3: {SIGNAL_CONFIG['take_profit_3']}%\n"
         f"• Мин. R:R: 1:{SIGNAL_CONFIG['risk_reward_min']}\n\n"
         f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M:%S')}</i>")
-    await update.message.reply_html(status)
+    send_message(chat_id, status)
 
 
 # ============ CALLBACKS ============
 
-async def cb_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Анализирую...")
+def handle_callback(query: dict):
+    chat_id = query["message"]["chat"]["id"]
+    message_id = query["message"]["message_id"]
+    data = query["data"]
 
-    symbol = query.data.split("_")[1].upper() + "USDT"
+    # Ответ на callback
+    tg_post("answerCallbackQuery", {"callback_query_id": query["id"], "text": "Обрабатываю..."})
 
-    a = await analyze_symbol(symbol)
-    if a:
-        text = format_signal(a)
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Обновить", callback_data=f"signal_{a['symbol']}")],
-            [InlineKeyboardButton("📊 Binance", url=f"https://www.binance.com/ru/trade/{a['symbol']}_USDT")]
-        ])
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    if data.startswith("signal_"):
+        symbol = data.split("_")[1].upper() + "USDT"
+        a = analyze_symbol(symbol)
+        if a:
+            text = format_signal(a)
+            kb = {
+                "inline_keyboard": [
+                    [{"text": "🔄 Обновить", "callback_data": f"signal_{a['symbol']}"}],
+                    [{"text": "📊 Binance", "url": f"https://www.binance.com/ru/trade/{a['symbol']}_USDT"}]
+                ]
+            }
+            edit_message(chat_id, message_id, text, reply_markup=kb)
 
+    elif data == "watchlist":
+        analyses = [analyze_symbol(s) for s in WATCHLIST]
+        analyses = [r for r in analyses if r]
+        analyses.sort(key=lambda x: x["quote_volume_24h"], reverse=True)
+        text = format_watchlist(analyses)
+        kb = {"inline_keyboard": [[{"text": "🔄 Обновить", "callback_data": "watchlist"}]]}
+        edit_message(chat_id, message_id, text, reply_markup=kb)
 
-async def cb_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Обновляю...")
+    elif data == "scanner":
+        cmd_scanner(chat_id)
 
-    tasks = [analyze_symbol(s) for s in WATCHLIST]
-    results = await asyncio.gather(*tasks)
-    analyses = [r for r in results if r]
-    analyses.sort(key=lambda x: x["quote_volume_24h"], reverse=True)
-
-    text = format_watchlist(analyses)
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Обновить", callback_data="watchlist")]
-    ])
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
-
-
-async def cb_scanner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Сканирую...")
-
-    # Создаём фейковый update для cmd_scanner
-    fake_update = Update(update.update_id, message=query.message)
-    await cmd_scanner(fake_update, context)
+    elif data == "signals_refresh":
+        cmd_signals(chat_id)
 
 
-async def cb_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Обновляю...")
+# ============ ОБРАБОТКА СООБЩЕНИЙ ============
 
-    fake_update = Update(update.update_id, message=query.message)
-    await cmd_signals(fake_update, context)
+def handle_message(msg: dict):
+    chat_id = msg["chat"]["id"]
+    text = msg.get("text", "")
+
+    if not text.startswith("/"):
+        return
+
+    parts = text.split()
+    cmd = parts[0].lower()
+    args = parts[1:]
+
+    if cmd == "/start":
+        cmd_start(chat_id)
+    elif cmd == "/help":
+        cmd_help(chat_id)
+    elif cmd == "/signal":
+        cmd_signal(chat_id, args)
+    elif cmd == "/signals":
+        cmd_signals(chat_id)
+    elif cmd == "/watchlist":
+        cmd_watchlist(chat_id)
+    elif cmd == "/top":
+        cmd_top(chat_id)
+    elif cmd == "/scanner":
+        cmd_scanner(chat_id)
+    elif cmd == "/status":
+        cmd_status(chat_id)
+    else:
+        send_message(chat_id, "❓ Неизвестная команда. Используй /help")
 
 
-# ============ ЗАПУСК ============
+# ============ ГЛАВНЫЙ ЦИКЛ ============
 
-async def main():
-    logger.info("Запуск Crypto Signal Bot v3.0...")
+def poll_updates():
+    """Основной цикл polling"""
+    offset = 0
+    logger.info("Запуск Crypto Signal Bot v4.0...")
 
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # Команды
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("help", cmd_help))
-    application.add_handler(CommandHandler("signal", cmd_signal))
-    application.add_handler(CommandHandler("signals", cmd_signals))
-    application.add_handler(CommandHandler("watchlist", cmd_watchlist))
-    application.add_handler(CommandHandler("top", cmd_top))
-    application.add_handler(CommandHandler("scanner", cmd_scanner))
-    application.add_handler(CommandHandler("status", cmd_status))
-
-    # Callbacks
-    application.add_handler(CallbackQueryHandler(cb_signal, pattern="^signal_"))
-    application.add_handler(CallbackQueryHandler(cb_watchlist, pattern="^watchlist$"))
-    application.add_handler(CallbackQueryHandler(cb_scanner, pattern="^scanner$"))
-    application.add_handler(CallbackQueryHandler(cb_signals, pattern="^signals_refresh$"))
-
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-
-    # Держим бота запущенным
-    logger.info("Бот запущен и ждёт сообщений...")
     while True:
-        await asyncio.sleep(3600)
+        try:
+            result = tg_get("getUpdates", {"offset": offset, "timeout": 30})
+
+            if not result or not result.get("ok"):
+                time.sleep(5)
+                continue
+
+            updates = result.get("result", [])
+
+            for update in updates:
+                offset = update["update_id"] + 1
+
+                if "message" in update:
+                    handle_message(update["message"])
+                elif "callback_query" in update:
+                    handle_callback(update["callback_query"])
+
+            if not updates:
+                time.sleep(1)
+
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+            time.sleep(5)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    poll_updates()
