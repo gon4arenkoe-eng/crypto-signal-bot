@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Crypto Signal Bot v2.2 — Windows fix + SSL fix
+Crypto Signal Bot v3.0 — на python-telegram-bot
+Работает на Railway без pydantic
 """
 
 import asyncio
@@ -11,17 +12,16 @@ from datetime import datetime
 from typing import Optional, List
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.enums import ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ============ WINDOWS FIX ============
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # ============ КОНФИГУРАЦИЯ ============
-BOT_TOKEN = "8877368954:AAGqwHfHlpzgbKrIoNu-tFIbDaz8ApLUH9I"
+import os
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 BINANCE_API = "https://api.binance.com/api/v3"
 
 WATCHLIST = [
@@ -45,12 +45,8 @@ SIGNAL_CONFIG = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# SSL контекст для Windows
 ssl_context = ssl.create_default_context()
 ssl_context.set_ciphers('DEFAULT@SECLEVEL=1')
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
 
 
 # ============ BINANCE API ============
@@ -445,11 +441,10 @@ def format_watchlist(analyses: List[dict]) -> str:
     return "\n".join(lines)
 
 
-# ============ КОМАНДЫ ============
+# ============ ОБРАБОТЧИКИ КОМАНД ============
 
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    welcome = ("🤖 <b>Crypto Signal Bot v2.0</b>\n\n"
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome = ("🤖 <b>Crypto Signal Bot v3.0</b>\n\n"
         "Я анализирую рынок и даю готовые торговые сигналы с:\n"
         "• 🎯 <b>Точкой входа</b>\n"
         "• 🛑 <b>Стоп-лоссом</b>\n"
@@ -464,16 +459,15 @@ async def cmd_start(message: types.Message):
         "/help — Справка\n\n"
         "⚠️ <i>Не финансовый совет. Управляй рисками!</i>")
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📈 Сигнал BTC", callback_data="signal_BTC")],
-        [InlineKeyboardButton(text="📊 Обзор рынка", callback_data="watchlist")],
-        [InlineKeyboardButton(text="🔍 Сканер", callback_data="scanner")]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📈 Сигнал BTC", callback_data="signal_BTC")],
+        [InlineKeyboardButton("📊 Обзор рынка", callback_data="watchlist")],
+        [InlineKeyboardButton("🔍 Сканер", callback_data="scanner")]
     ])
-    await message.answer(welcome, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await update.message.reply_html(welcome, reply_markup=kb)
 
 
-@dp.message(Command("help"))
-async def cmd_help(message: types.Message):
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = ("<b>📚 Справка</b>\n\n"
         "<b>/signal [монета]</b> — Детальный сигнал с уровнями\n"
         "  Пример: /signal BTC, /signal ETH\n\n"
@@ -491,19 +485,18 @@ async def cmd_help(message: types.Message):
         "• Стоп всегда ставить!\n"
         "• 50% закрывать на TP1, стоп в БУ\n"
         "• Не рисковать >2% депозита на сделку")
-    await message.answer(help_text, parse_mode=ParseMode.HTML)
+    await update.message.reply_html(help_text)
 
 
-@dp.message(Command("signal"))
-async def cmd_signal(message: types.Message):
-    args = message.text.split()[1:]
+async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
     symbol = (args[0].upper() + "USDT") if args else "BTCUSDT"
 
     if symbol not in WATCHLIST and symbol != "BTCUSDT":
-        await message.answer(f"❌ {symbol} не в списке. Используй /watchlist")
+        await update.message.reply_text(f"❌ {symbol} не в списке. Используй /watchlist")
         return
 
-    wait = await message.answer(f"🔍 Анализ {symbol.replace('USDT','')}/USDT...")
+    wait = await update.message.reply_text(f"🔍 Анализ {symbol.replace('USDT','')}/USDT...")
 
     a = await analyze_symbol(symbol)
     if not a:
@@ -512,17 +505,16 @@ async def cmd_signal(message: types.Message):
 
     text = format_signal(a)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"signal_{a['symbol']}")],
-        [InlineKeyboardButton(text="📊 Binance", url=f"https://www.binance.com/ru/trade/{a['symbol']}_USDT")]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data=f"signal_{a['symbol']}")],
+        [InlineKeyboardButton("📊 Binance", url=f"https://www.binance.com/ru/trade/{a['symbol']}_USDT")]
     ])
 
-    await wait.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await wait.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 
-@dp.message(Command("signals"))
-async def cmd_signals(message: types.Message):
-    wait = await message.answer("🔍 Ищу сигналы...")
+async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wait = await update.message.reply_text("🔍 Ищу сигналы...")
 
     tasks = [analyze_symbol(s) for s in WATCHLIST]
     results = await asyncio.gather(*tasks)
@@ -549,16 +541,15 @@ async def cmd_signals(message: types.Message):
         lines.append(f"   RSI: {a['rsi_1h']} | 24ч: {a['price_change_24h']:+.1f}%")
         lines.append("")
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="signals_refresh")]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data="signals_refresh")]
     ])
 
-    await wait.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=kb)
+    await wait.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
 
 
-@dp.message(Command("watchlist"))
-async def cmd_watchlist(message: types.Message):
-    wait = await message.answer("📊 Загружаю рынок...")
+async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wait = await update.message.reply_text("📊 Загружаю рынок...")
 
     tasks = [analyze_symbol(s) for s in WATCHLIST]
     results = await asyncio.gather(*tasks)
@@ -567,16 +558,15 @@ async def cmd_watchlist(message: types.Message):
 
     text = format_watchlist(analyses)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="watchlist")]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data="watchlist")]
     ])
 
-    await wait.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await wait.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 
-@dp.message(Command("top"))
-async def cmd_top(message: types.Message):
-    wait = await message.answer("🔝 Ищу топ...")
+async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wait = await update.message.reply_text("🔝 Ищу топ...")
 
     tickers = await get_all_tickers()
     if not tickers:
@@ -599,12 +589,11 @@ async def cmd_top(message: types.Message):
         lines.append(f"   ${price:,.4f} | {change:+.2f}% | Объём: ${vol/1e6:.1f}M")
         lines.append("")
 
-    await wait.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await wait.edit_text("\n".join(lines), parse_mode="HTML")
 
 
-@dp.message(Command("scanner"))
-async def cmd_scanner(message: types.Message):
-    wait = await message.answer("🔍 Сканирую рынок на лучшие сигналы...\nЭто может занять 10-15 секунд...")
+async def cmd_scanner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wait = await update.message.reply_text("🔍 Сканирую рынок на лучшие сигналы...\nЭто может занять 10-15 секунд...")
 
     tasks = [analyze_symbol(s) for s in WATCHLIST]
     results = await asyncio.gather(*tasks)
@@ -635,17 +624,16 @@ async def cmd_scanner(message: types.Message):
         lines.append(f"   RSI: {a['rsi_1h']} | Объём: x{a['volume_spike']}")
         lines.append("")
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Пересканировать", callback_data="scanner")],
-        [InlineKeyboardButton(text="📈 Сигнал BTC", callback_data="signal_BTC")]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Пересканировать", callback_data="scanner")],
+        [InlineKeyboardButton("📈 Сигнал BTC", callback_data="signal_BTC")]
     ])
 
-    await wait.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=kb)
+    await wait.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
 
 
-@dp.message(Command("status"))
-async def cmd_status(message: types.Message):
-    status = (f"🤖 <b>Статус бота v2.0</b>\n\n"
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = (f"🤖 <b>Статус бота v3.0</b>\n\n"
         f"✅ Онлайн\n"
         f"📡 Binance Spot API\n"
         f"📊 Пар: {len(WATCHLIST)}\n\n"
@@ -657,58 +645,91 @@ async def cmd_status(message: types.Message):
         f"• TP3: {SIGNAL_CONFIG['take_profit_3']}%\n"
         f"• Мин. R:R: 1:{SIGNAL_CONFIG['risk_reward_min']}\n\n"
         f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M:%S')}</i>")
-    await message.answer(status, parse_mode=ParseMode.HTML)
+    await update.message.reply_html(status)
 
 
 # ============ CALLBACKS ============
 
-@dp.callback_query(F.data.startswith("signal_"))
-async def cb_signal(callback: types.CallbackQuery):
-    symbol = callback.data.split("_")[1].upper() + "USDT"
-    await callback.answer("Анализирую...")
+async def cb_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Анализирую...")
+
+    symbol = query.data.split("_")[1].upper() + "USDT"
 
     a = await analyze_symbol(symbol)
     if a:
         text = format_signal(a)
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"signal_{a['symbol']}")],
-            [InlineKeyboardButton(text="📊 Binance", url=f"https://www.binance.com/ru/trade/{a['symbol']}_USDT")]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Обновить", callback_data=f"signal_{a['symbol']}")],
+            [InlineKeyboardButton("📊 Binance", url=f"https://www.binance.com/ru/trade/{a['symbol']}_USDT")]
         ])
-        await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
 
 
-@dp.callback_query(F.data == "watchlist")
-async def cb_watchlist(callback: types.CallbackQuery):
-    await callback.answer("Обновляю...")
+async def cb_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Обновляю...")
+
     tasks = [analyze_symbol(s) for s in WATCHLIST]
     results = await asyncio.gather(*tasks)
     analyses = [r for r in results if r]
     analyses.sort(key=lambda x: x["quote_volume_24h"], reverse=True)
 
     text = format_watchlist(analyses)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="watchlist")]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data="watchlist")]
     ])
-    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
 
 
-@dp.callback_query(F.data == "scanner")
-async def cb_scanner(callback: types.CallbackQuery):
-    await callback.answer("Сканирую...")
-    await cmd_scanner(callback.message)
+async def cb_scanner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Сканирую...")
+
+    # Создаём фейковый update для cmd_scanner
+    fake_update = Update(update.update_id, message=query.message)
+    await cmd_scanner(fake_update, context)
 
 
-@dp.callback_query(F.data == "signals_refresh")
-async def cb_signals(callback: types.CallbackQuery):
-    await callback.answer("Обновляю...")
-    await cmd_signals(callback.message)
+async def cb_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Обновляю...")
+
+    fake_update = Update(update.update_id, message=query.message)
+    await cmd_signals(fake_update, context)
 
 
 # ============ ЗАПУСК ============
 
 async def main():
-    logger.info("Запуск Crypto Signal Bot v2.2...")
-    await dp.start_polling(bot)
+    logger.info("Запуск Crypto Signal Bot v3.0...")
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Команды
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("signal", cmd_signal))
+    application.add_handler(CommandHandler("signals", cmd_signals))
+    application.add_handler(CommandHandler("watchlist", cmd_watchlist))
+    application.add_handler(CommandHandler("top", cmd_top))
+    application.add_handler(CommandHandler("scanner", cmd_scanner))
+    application.add_handler(CommandHandler("status", cmd_status))
+
+    # Callbacks
+    application.add_handler(CallbackQueryHandler(cb_signal, pattern="^signal_"))
+    application.add_handler(CallbackQueryHandler(cb_watchlist, pattern="^watchlist$"))
+    application.add_handler(CallbackQueryHandler(cb_scanner, pattern="^scanner$"))
+    application.add_handler(CallbackQueryHandler(cb_signals, pattern="^signals_refresh$"))
+
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+
+    # Держим бота запущенным
+    logger.info("Бот запущен и ждёт сообщений...")
+    while True:
+        await asyncio.sleep(3600)
 
 
 if __name__ == "__main__":
