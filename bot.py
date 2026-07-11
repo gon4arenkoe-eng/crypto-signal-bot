@@ -1,28 +1,233 @@
 #!/usr/bin/env python3
 """
-Crypto Signal Bot v5.0 — Flask + Webhook
-Работает на Railway без прямого подключения к api.telegram.org
+Crypto Signal Bot v6.0 — CoinGecko API
+Работает на Railway, Render, Heroku и т.д. без прокси!
+Без API key — keyless доступ. С API key — до 100 req/min.
 """
 
 import os
 import logging
 import threading
+import time
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict
+from functools import lru_cache
 
 import requests
 from flask import Flask, request, jsonify
 
 # ============ КОНФИГУРАЦИЯ ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # Railway домен
-BINANCE_API = "https://api.binance.com/api/v3"
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+CG_API_KEY = os.environ.get("CG_API_KEY", "")  # Опционально, для Demo/Analyst плана
+CG_BASE_URL = "https://api.coingecko.com/api/v3"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Маппинг: Binance символ -> CoinGecko ID
+COIN_MAP = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+    "XRP": "ripple",
+    "DOGE": "dogecoin",
+    "ADA": "cardano",
+    "DOT": "polkadot",
+    "LINK": "chainlink",
+    "AVAX": "avalanche-2",
+    "MATIC": "matic-network",
+    "BNB": "binancecoin",
+    "UNI": "uniswap",
+    "LTC": "litecoin",
+    "ATOM": "cosmos",
+    "NEAR": "near",
+    "APT": "aptos",
+    "ARB": "arbitrum",
+    "OP": "optimism",
+    "SUI": "sui",
+    "SEI": "sei-network",
+    "TIA": "celestia",
+    "INJ": "injective-protocol",
+    "RENDER": "render-token",
+    "FET": "fetch-ai",
+    "PEPE": "pepe",
+    "SHIB": "shiba-inu",
+    "WLD": "worldcoin-wld",
+    "STRK": "starknet",
+    "IMX": "immutable-x",
+    "GRT": "the-graph",
+    "AAVE": "aave",
+    "MKR": "maker",
+    "LDO": "lido-dao",
+    "CRV": "curve-dao-token",
+    "SNX": "havven",
+    "COMP": "compound-governance-token",
+    "YFI": "yearn-finance",
+    "1INCH": "1inch",
+    "DYDX": "dydx",
+    "SUSHI": "sushi",
+    "BAL": "balancer",
+    "FXS": "frax-share",
+    "CVX": "convex-finance",
+    "GMX": "gmx",
+    "RDNT": "radiant-capital",
+    "MAGIC": "magic",
+    "ARB": "arbitrum",
+    "OP": "optimism",
+    "BASE": "base",
+    "ZRO": "layerzero",
+    "ENA": "ethena",
+    "WIF": "dogwifcoin",
+    "BONK": "bonk",
+    "FLOKI": "floki",
+    "MEME": "memecoin",
+    "TURBO": "turbo",
+    "PEOPLE": "constitutiondao",
+    "TRB": "tellor",
+    "PENDLE": "pendle",
+    "EIGEN": "eigenlayer",
+    "ETHFI": "ether-fi",
+    "REZ": "renzo",
+    "SAGA": "saga-2",
+    "OMNI": "omni-network",
+    "DYM": "dymension",
+    "MANTA": "manta-network",
+    "ALT": "altlayer",
+    "PIXEL": "pixels",
+    "PORTAL": "portal",
+    "AEVO": "aevo",
+    "ETHENA": "ethena",
+    "W": "wormhole",
+    "ZK": "zksync",
+    "BLAST": "blast",
+    "MODE": "mode",
+    "MNT": "mantle",
+    "STRK": "starknet",
+    "SC": "siacoin",
+    "BEAM": "beam-2",
+    "KAS": "kaspa",
+    "TAO": "bittensor",
+    "RNDR": "render-token",
+    "AGIX": "singularitynet",
+    "OCEAN": "ocean-protocol",
+    "NMR": "numeraire",
+    "RLC": "iexec-rlc",
+    "GNT": "golem",
+    "STORJ": "storj",
+    "FIL": "filecoin",
+    "AR": "arweave",
+    "HNT": "helium",
+    "IOTA": "iota",
+    "XMR": "monero",
+    "ZEC": "zcash",
+    "DASH": "dash",
+    "ETC": "ethereum-classic",
+    "BCH": "bitcoin-cash",
+    "BSV": "bitcoin-cash-sv",
+    "XLM": "stellar",
+    "ALGO": "algorand",
+    "XTZ": "tezos",
+    "EOS": "eos",
+    "TRX": "tron",
+    "VET": "vechain",
+    "ICP": "internet-computer",
+    "THETA": "theta-token",
+    "CHZ": "chiliz",
+    "ENJ": "enjincoin",
+    "SAND": "the-sandbox",
+    "MANA": "decentraland",
+    "AXS": "axie-infinity",
+    "GALA": "gala",
+    "ILV": "illuvium",
+    "YGG": "yield-guild-games",
+    "MC": "merit-circle",
+    "BIGTIME": "big-time",
+    "PYR": "vulcan-forged",
+    "UOS": "ultra",
+    "ALICE": "my-neighbor-alice",
+    "TLM": "alien-worlds",
+    "ATLAS": "star-atlas",
+    "POLIS": "star-atlas-dao",
+    "AURY": "aurory",
+    "GENE": "genopets",
+    "GST": "green-satoshi-token",
+    "GMT": "stepn",
+    "FITFI": "step-app",
+    "MOVE": "move",
+    "PRIME": "echelon-prime",
+    "DMT": "dark-matter",
+    "XAI": "xai",
+    "RON": "ronin",
+    "IMX": "immutable-x",
+    "GODS": "gods-unchained",
+    "SUPER": "superfarm",
+    "BICO": "biconomy",
+    "ZETA": "zetachain",
+    "DEGEN": "degen-base",
+    "AERO": "aerodrome-finance",
+    "VELO": "velodrome-finance",
+    "SYN": "synapse-2",
+    "ACX": "across-protocol",
+    "STG": "stargate-finance",
+    "CAKE": "pancakeswap-token",
+    "JOE": "joe",
+    "GRAIL": "camelot-token",
+    "RAM": "ramses-exchange",
+    "THENX": "thena",
+    "THE": "thena",
+    "BANANA": "banana-gun",
+    "MAV": "maverick-protocol",
+    "IZI": "izumi-finance",
+    "MERL": "merlin-chain",
+    "BOME": "book-of-meme",
+    "SLERF": "slerf",
+    "MEW": "cat-in-a-dogs-world",
+    "POPCAT": "popcat",
+    "MOG": "mog-coin",
+    "MICHI": "michicoin",
+    "BRETT": "brett",
+    "ANDY": "andy",
+    "APU": "apu-apustaja",
+    "BOBO": "bobo",
+    "PEPEC": "pepe-2",
+    "PEIPEI": "peipei",
+    "PEPEW": "pepew",
+    "PEPE2": "pepe-2",
+    "PEPE3": "pepe-3",
+    "PEPE4": "pepe-4",
+    "PEPE5": "pepe-5",
+    "PEPE6": "pepe-6",
+    "PEPE7": "pepe-7",
+    "PEPE8": "pepe-8",
+    "PEPE9": "pepe-9",
+    "PEPE10": "pepe-10",
+}
+
+# Обратный маппинг для отображения
+ID_TO_SYMBOL = {v: k for k, v in COIN_MAP.items()}
+
 WATCHLIST = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
-    "ADAUSDT", "DOTUSDT", "LINKUSDT", "AVAXUSDT", "MATICUSDT",
-    "BNBUSDT", "UNIUSDT", "LTCUSDT", "ATOMUSDT", "NEARUSDT"
+    "BTC", "ETH", "SOL", "XRP", "DOGE",
+    "ADA", "DOT", "LINK", "AVAX", "MATIC",
+    "BNB", "UNI", "LTC", "ATOM", "NEAR",
+    "APT", "ARB", "OP", "SUI", "SEI",
+    "TIA", "INJ", "RENDER", "FET", "PEPE",
+    "SHIB", "WLD", "STRK", "IMX", "GRT",
+    "AAVE", "MKR", "LDO", "CRV", "SNX",
+    "COMP", "YFI", "1INCH", "DYDX", "SUSHI",
+    "BAL", "FXS", "CVX", "GMX", "RDNT",
+    "MAGIC", "WIF", "BONK", "FLOKI", "MEME",
+    "TURBO", "PEOPLE", "TRB", "PENDLE", "EIGEN",
+    "ETHFI", "REZ", "SAGA", "OMNI", "DYM",
+    "MANTA", "ALT", "PIXEL", "PORTAL", "AEVO",
+    "W", "ZK", "MNT", "KAS", "TAO",
+    "RNDR", "AGIX", "OCEAN", "FIL", "AR",
+    "XMR", "BCH", "XLM", "ALGO", "XTZ",
+    "TRX", "VET", "ICP", "THETA", "CHZ",
+    "SAND", "MANA", "AXS", "GALA", "GMT",
+    "PRIME", "RON", "SUPER", "ZETA", "DEGEN",
+    "AERO", "VELO", "CAKE", "JOE", "BANANA",
+    "MAV", "BOME", "SLERF", "MEW", "POPCAT",
+    "MOG", "BRETT", "ANDY", "APU", "BOBO",
 ]
 
 SIGNAL_CONFIG = {
@@ -42,6 +247,117 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 session = requests.Session()
+
+# ============ COINGECKO API ============
+
+class CoinGeckoAPI:
+    """Класс для работы с CoinGecko API с rate limiting и кэшированием"""
+
+    def __init__(self, api_key: str = ""):
+        self.api_key = api_key
+        self.base_url = CG_BASE_URL
+        self.session = requests.Session()
+        self.last_request_time = 0
+        self.min_delay = 0.6 if not api_key else 0.01  # 0.6s без ключа, 0.01s с ключом
+
+        if api_key:
+            self.session.headers.update({"x-cg-demo-api-key": api_key})
+
+    def _rate_limit(self):
+        """Простой rate limiter"""
+        elapsed = time.time() - self.last_request_time
+        if elapsed < self.min_delay:
+            time.sleep(self.min_delay - elapsed)
+        self.last_request_time = time.time()
+
+    def _get(self, endpoint: str, params: dict = None) -> Optional[dict]:
+        """GET запрос с rate limiting"""
+        self._rate_limit()
+        try:
+            url = f"{self.base_url}/{endpoint}"
+            resp = self.session.get(url, params=params, timeout=15)
+            if resp.status_code == 200:
+                return resp.json()
+            elif resp.status_code == 429:
+                logger.warning("Rate limit hit! Waiting 60s...")
+                time.sleep(60)
+                return self._get(endpoint, params)  # Retry
+            else:
+                logger.error(f"CoinGecko error {resp.status_code}: {resp.text}")
+                return None
+        except Exception as e:
+            logger.error(f"CoinGecko request error: {e}")
+            return None
+
+    def get_simple_price(self, ids: List[str], vs_currencies: str = "usd",
+                         include_24hr_change: bool = True,
+                         include_24hr_vol: bool = True,
+                         include_market_cap: bool = True) -> Optional[dict]:
+        """Простые цены (до 250 ID за запрос)"""
+        ids_str = ",".join(ids)
+        params = {
+            "ids": ids_str,
+            "vs_currencies": vs_currencies,
+            "include_24hr_change": str(include_24hr_change).lower(),
+            "include_24hr_vol": str(include_24hr_vol).lower(),
+            "include_market_cap": str(include_market_cap).lower(),
+            "include_last_updated_at": "true",
+        }
+        return self._get("simple/price", params)
+
+    def get_markets(self, vs_currency: str = "usd", per_page: int = 250,
+                    page: int = 1, sparkline: bool = False) -> Optional[List[dict]]:
+        """Рыночные данные топ-монет"""
+        params = {
+            "vs_currency": vs_currency,
+            "order": "market_cap_desc",
+            "per_page": per_page,
+            "page": page,
+            "sparkline": str(sparkline).lower(),
+            "price_change_percentage": "24h,7d",
+        }
+        return self._get("coins/markets", params)
+
+    def get_coin_data(self, coin_id: str) -> Optional[dict]:
+        """Детальные данные по монете"""
+        params = {
+            "localization": "false",
+            "tickers": "false",
+            "market_data": "true",
+            "community_data": "false",
+            "developer_data": "false",
+            "sparkline": "false",
+        }
+        return self._get(f"coins/{coin_id}", params)
+
+    def get_market_chart(self, coin_id: str, vs_currency: str = "usd",
+                         days: int = 30) -> Optional[dict]:
+        """Исторические данные: prices, market_caps, total_volumes"""
+        params = {
+            "vs_currency": vs_currency,
+            "days": days,
+            "interval": "daily" if days > 90 else "hourly",
+        }
+        return self._get(f"coins/{coin_id}/market_chart", params)
+
+    def get_ohlc(self, coin_id: str, vs_currency: str = "usd",
+                 days: int = 30) -> Optional[List[List]]:
+        """OHLCV данные: [[timestamp, open, high, low, close], ...]"""
+        params = {
+            "vs_currency": vs_currency,
+            "days": days,
+        }
+        return self._get(f"coins/{coin_id}/ohlc", params)
+
+    def search(self, query: str) -> Optional[List[dict]]:
+        """Поиск монет"""
+        params = {"query": query}
+        result = self._get("search", params)
+        return result.get("coins", []) if result else None
+
+
+# Глобальный инстанс API
+cg = CoinGeckoAPI(api_key=CG_API_KEY)
 
 
 # ============ TELEGRAM API ============
@@ -70,41 +386,41 @@ def edit_message(chat_id: int, message_id: int, text: str, parse_mode: str = "HT
 
 
 def set_webhook(url: str):
-    """Установить webhook для Telegram"""
     result = tg_post("setWebhook", {"url": url})
     logger.info(f"Webhook set: {result}")
     return result
 
 
 def delete_webhook():
-    """Удалить webhook"""
     result = tg_post("deleteWebhook")
     logger.info(f"Webhook deleted: {result}")
     return result
 
 
-# ============ BINANCE API ============
+# ============ КЭШИРОВАНИЕ ============
 
-def fetch_binance(endpoint: str, params: dict = None):
-    try:
-        resp = session.get(f"{BINANCE_API}/{endpoint}", params=params, timeout=15)
-        return resp.json() if resp.status_code == 200 else None
-    except Exception as e:
-        logger.error(f"Binance error: {e}")
+class Cache:
+    """Простой in-memory кэш с TTL"""
+    def __init__(self, ttl: int = 60):
+        self._cache = {}
+        self.ttl = ttl
+
+    def get(self, key: str):
+        if key in self._cache:
+            data, timestamp = self._cache[key]
+            if time.time() - timestamp < self.ttl:
+                return data
+            del self._cache[key]
         return None
 
+    def set(self, key: str, data):
+        self._cache[key] = (data, time.time())
 
-def get_ticker_24h(symbol: str):
-    return fetch_binance("ticker/24hr", {"symbol": symbol})
-
-
-def get_klines(symbol: str, interval: str = "1h", limit: int = 200):
-    data = fetch_binance("klines", {"symbol": symbol, "interval": interval, "limit": limit})
-    return data or []
+    def clear(self):
+        self._cache.clear()
 
 
-def get_all_tickers():
-    return fetch_binance("ticker/24hr") or []
+cache = Cache(ttl=60)
 
 
 # ============ ТЕХНИЧЕСКИЙ АНАЛИЗ ============
@@ -145,14 +461,15 @@ def calc_macd(closes: List[float]) -> tuple:
     return macd_line[-1], signal_line[-1] if signal_line else 0, hist[-1] if hist else 0
 
 
-def calc_atr(klines: List[List], period: int = 14) -> float:
-    if len(klines) < period + 1:
+def calc_atr(ohlcv: List[List], period: int = 14) -> float:
+    """ATR из OHLCV: [[timestamp, open, high, low, close], ...]"""
+    if len(ohlcv) < period + 1:
         return 0.0
     trs = []
-    for i in range(1, len(klines)):
-        high = float(klines[i][2])
-        low = float(klines[i][3])
-        prev_close = float(klines[i-1][4])
+    for i in range(1, len(ohlcv)):
+        high = float(ohlcv[i][2])
+        low = float(ohlcv[i][3])
+        prev_close = float(ohlcv[i-1][4])
         tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         trs.append(tr)
     return round(sum(trs[-period:]) / period, 4)
@@ -170,8 +487,8 @@ def calc_bollinger(closes: List[float], period: int = 20, std_dev: int = 2):
     return round(upper, 2), round(sma, 2), round(lower, 2)
 
 
-def calc_support_resistance(klines: List[List], lookback: int = 20):
-    recent = klines[-lookback:]
+def calc_support_resistance(ohlcv: List[List], lookback: int = 20):
+    recent = ohlcv[-lookback:]
     highs = [float(k[2]) for k in recent]
     lows = [float(k[3]) for k in recent]
     return round(max(highs), 2), round(min(lows), 2)
@@ -227,32 +544,114 @@ def calculate_levels(signal: str, entry: float, atr: float, support: float, resi
 
 # ============ ОСНОВНОЙ АНАЛИЗ ============
 
-def analyze_symbol(symbol: str) -> Optional[dict]:
-    ticker = get_ticker_24h(symbol)
-    k1h = get_klines(symbol, "1h", 200)
-    k4h = get_klines(symbol, "4h", 100)
+def get_ohlcv_from_market_chart(coin_id: str, days: int = 30) -> Optional[List[List]]:
+    """
+    Конвертируем market_chart данные в OHLCV формат.
+    CoinGecko market_chart возвращает prices, market_caps, total_volumes
+    без OHLC, поэтому аппроксимируем через OHLC эндпоинт.
+    """
+    ohlc = cg.get_ohlc(coin_id, days=days)
+    if ohlc and len(ohlc) > 0:
+        # OHLC возвращает: [[timestamp, open, high, low, close], ...]
+        return ohlc
+    return None
 
-    if not ticker or not k1h or len(k1h) < 50:
+
+def get_prices_and_volumes(coin_id: str, days: int = 30) -> tuple:
+    """Получить цены и объёмы для анализа"""
+    cache_key = f"chart_{coin_id}_{days}"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    chart = cg.get_market_chart(coin_id, days=days)
+    if not chart:
+        return None, None
+
+    prices = [p[1] for p in chart.get("prices", [])]
+    volumes = [v[1] for v in chart.get("total_volumes", [])]
+
+    result = (prices, volumes)
+    cache.set(cache_key, result)
+    return result
+
+
+def analyze_symbol(symbol: str) -> Optional[dict]:
+    """
+    Анализ монеты через CoinGecko API.
+    symbol: например "BTC", "ETH"
+    """
+    coin_id = COIN_MAP.get(symbol.upper())
+    if not coin_id:
+        logger.warning(f"Unknown symbol: {symbol}")
         return None
 
-    closes_1h = [float(k[4]) for k in k1h]
-    volumes_1h = [float(k[5]) for k in k1h]
-    closes_4h = [float(k[4]) for k in k4h] if k4h else closes_1h[::4]
+    # 1. Получаем текущие данные (кэшируем на 30 сек)
+    cache_key = f"price_{coin_id}"
+    price_data = cache.get(cache_key)
+
+    if not price_data:
+        price_data = cg.get_simple_price([coin_id], include_24hr_change=True, include_24hr_vol=True)
+        if price_data:
+            cache.set(cache_key, price_data)
+
+    if not price_data or coin_id not in price_data:
+        return None
+
+    coin_info = price_data[coin_id]
+    price = float(coin_info.get("usd", 0))
+    price_change = float(coin_info.get("usd_24h_change", 0) or 0)
+    volume_24h = float(coin_info.get("usd_24h_vol", 0) or 0)
+    market_cap = float(coin_info.get("usd_market_cap", 0) or 0)
+
+    if price == 0:
+        return None
+
+    # 2. Получаем исторические данные
+    prices, volumes = get_prices_and_volumes(coin_id, days=30)
+    if not prices or len(prices) < 50:
+        # Пробуем 7 дней если 30 недоступно
+        prices, volumes = get_prices_and_volumes(coin_id, days=7)
+        if not prices or len(prices) < 50:
+            return None
+
+    # 3. Получаем OHLC для ATR и уровней
+    ohlcv = get_ohlcv_from_market_chart(coin_id, days=30)
+    if not ohlcv or len(ohlcv) < 20:
+        ohlcv = get_ohlcv_from_market_chart(coin_id, days=7)
+
+    # 4. Технический анализ
+    closes = prices
+
+    # Используем hourly данные, разбиваем на 1H и 4H
+    # prices приходят почасовые (если days <= 90)
+    closes_1h = closes
+    closes_4h = closes[::4] if len(closes) >= 4 * 14 else closes
 
     rsi_1h = calc_rsi(closes_1h)
     rsi_4h = calc_rsi(closes_4h) if len(closes_4h) > 14 else rsi_1h
     macd_val, signal_val, histogram = calc_macd(closes_1h)
-    atr = calc_atr(k1h)
-    bb_upper, bb_mid, bb_lower = calc_bollinger(closes_1h)
-    resistance, support = calc_support_resistance(k1h)
-    volume_spike = calc_volume_spike(volumes_1h)
 
-    price = float(ticker["lastPrice"])
-    price_change = float(ticker["priceChangePercent"])
-    high_24h = float(ticker["highPrice"])
-    low_24h = float(ticker["lowPrice"])
-    quote_volume = float(ticker["quoteVolume"])
+    # ATR и уровни из OHLCV
+    if ohlcv and len(ohlcv) > 20:
+        atr = calc_atr(ohlcv)
+        bb_upper, bb_mid, bb_lower = calc_bollinger([float(k[4]) for k in ohlcv])
+        resistance, support = calc_support_resistance(ohlcv)
+        high_24h = max([float(k[2]) for k in ohlcv[-24:]]) if len(ohlcv) >= 24 else max([float(k[2]) for k in ohlcv])
+        low_24h = min([float(k[3]) for k in ohlcv[-24:]]) if len(ohlcv) >= 24 else min([float(k[3]) for k in ohlcv])
+    else:
+        # Fallback: используем только цены
+        atr = abs(price * 0.02)  # ~2% как fallback ATR
+        bb_upper, bb_mid, bb_lower = calc_bollinger(closes_1h)
+        recent = closes_1h[-20:]
+        resistance = round(max(recent), 2)
+        support = round(min(recent), 2)
+        high_24h = max(closes_1h[-24:]) if len(closes_1h) >= 24 else max(closes_1h)
+        low_24h = min(closes_1h[-24:]) if len(closes_1h) >= 24 else min(closes_1h)
 
+    volume_spike = calc_volume_spike(volumes) if volumes else 1.0
+
+    # 5. Генерация сигнала
     signal = None
     strength = 0
     reasons = []
@@ -304,6 +703,7 @@ def analyze_symbol(symbol: str) -> Optional[dict]:
         strength += 1
         reasons.append("Цена выше верхней полосы Боллинджера")
 
+    # 6. Расчёт уровней
     levels = {}
     if signal in ["BUY", "SELL"]:
         levels = calculate_levels(signal, price, atr, support, resistance, bb_upper, bb_lower)
@@ -314,12 +714,13 @@ def analyze_symbol(symbol: str) -> Optional[dict]:
             levels = {}
 
     return {
-        "symbol": symbol.replace("USDT", ""),
+        "symbol": symbol.upper(),
         "price": price,
         "price_change_24h": price_change,
         "high_24h": high_24h,
         "low_24h": low_24h,
-        "quote_volume_24h": quote_volume,
+        "quote_volume_24h": volume_24h,
+        "market_cap": market_cap,
         "rsi_1h": rsi_1h,
         "rsi_4h": rsi_4h,
         "macd": round(macd_val, 4),
@@ -350,6 +751,7 @@ def format_signal(a: dict) -> str:
     strength = a["signal_strength"]
     reasons = a["reasons"]
     levels = a.get("levels", {})
+    market_cap = a.get("market_cap", 0)
 
     if signal == "BUY":
         emoji = "🟢"
@@ -364,15 +766,24 @@ def format_signal(a: dict) -> str:
     stars = "⭐" * min(strength, 5) + "☆" * max(0, 5 - strength)
     change_emoji = "📈" if change >= 0 else "📉"
 
+    # Форматируем market cap
+    if market_cap >= 1e9:
+        mc_str = f"${market_cap/1e9:.1f}B"
+    elif market_cap >= 1e6:
+        mc_str = f"${market_cap/1e6:.1f}M"
+    else:
+        mc_str = f"${market_cap:,.0f}"
+
     lines = []
     lines.append(f"{emoji} <b>{symbol}/USDT</b> {emoji}")
     lines.append("")
     lines.append(f"<b>{signal_text}</b>")
     lines.append(f"Сила сигнала: {stars}")
     lines.append("")
-    lines.append(f"💰 <b>Текущая цена:</b> <code>${price:,.2f}</code>")
+    lines.append(f"💰 <b>Текущая цена:</b> <code>${price:,.4f}</code>")
     lines.append(f"{change_emoji} <b>Изменение 24ч:</b> <code>{change:+.2f}%</code>")
     lines.append(f"📊 <b>Объём 24ч:</b> <code>${a['quote_volume_24h']:,.0f}</code>")
+    lines.append(f"🏦 <b>Капитализация:</b> <code>{mc_str}</code>")
 
     if levels:
         entry = levels["entry"]
@@ -392,36 +803,36 @@ def format_signal(a: dict) -> str:
         lines.append("╔════════════════════════════════════════╗")
         lines.append("║     📍 УРОВНИ ТОРГОВЛИ                ║")
         lines.append("╠════════════════════════════════════════╣")
-        lines.append(f"║  🎯 <b>Вход:</b>          <code>${entry:,.2f}</code>           ║")
-        lines.append(f"║  🛑 <b>Стоп-лосс:</b>    <code>${sl:,.2f}</code>  ({sl_pct:.1f}%)   ║")
+        lines.append(f"║  🎯 <b>Вход:</b>          <code>${entry:,.4f}</code>           ║")
+        lines.append(f"║  🛑 <b>Стоп-лосс:</b>    <code>${sl:,.4f}</code>  ({sl_pct:.1f}%)   ║")
         lines.append("╠════════════════════════════════════════╣")
-        lines.append(f"║  💎 <b>Тейк 1:</b>       <code>${tp1:,.2f}</code>  (+{tp1_pct:.1f}%)  ║")
-        lines.append(f"║  💎💎 <b>Тейк 2:</b>     <code>${tp2:,.2f}</code>  (+{tp2_pct:.1f}%)  ║")
-        lines.append(f"║  💎💎💎 <b>Тейк 3:</b>   <code>${tp3:,.2f}</code>  (+{tp3_pct:.1f}%)  ║")
+        lines.append(f"║  💎 <b>Тейк 1:</b>       <code>${tp1:,.4f}</code>  (+{tp1_pct:.1f}%)  ║")
+        lines.append(f"║  💎💎 <b>Тейк 2:</b>     <code>${tp2:,.4f}</code>  (+{tp2_pct:.1f}%)  ║")
+        lines.append(f"║  💎💎💎 <b>Тейк 3:</b>   <code>${tp3:,.4f}</code>  (+{tp3_pct:.1f}%)  ║")
         lines.append("╠════════════════════════════════════════╣")
         lines.append(f"║  ⚖️ <b>Risk/Reward:</b>  <code>1:{rr}</code>              ║")
-        lines.append(f"║  📏 <b>Риск:</b>         <code>${risk:,.2f}</code>           ║")
+        lines.append(f"║  📏 <b>Риск:</b>         <code>${risk:,.4f}</code>           ║")
         lines.append("╚════════════════════════════════════════╝")
         lines.append("")
         lines.append("<b>📋 План сделки:</b>")
-        lines.append(f"  1️⃣ Вход по рынку или лимиткой ~${entry:,.2f}")
-        lines.append(f"  2️⃣ Стоп-лосс на ${sl:,.2f} ({sl_pct:.1f}%)")
-        lines.append(f"  3️⃣ 50% позиции закрыть на TP1 (${tp1:,.2f})")
-        lines.append(f"  4️⃣ 30% позиции закрыть на TP2 (${tp2:,.2f})")
-        lines.append(f"  5️⃣ 20% позиции закрыть на TP3 (${tp3:,.2f})")
+        lines.append(f"  1️⃣ Вход по рынку или лимиткой ~${entry:,.4f}")
+        lines.append(f"  2️⃣ Стоп-лосс на ${sl:,.4f} ({sl_pct:.1f}%)")
+        lines.append(f"  3️⃣ 50% позиции закрыть на TP1 (${tp1:,.4f})")
+        lines.append(f"  4️⃣ 30% позиции закрыть на TP2 (${tp2:,.4f})")
+        lines.append(f"  5️⃣ 20% позиции закрыть на TP3 (${tp3:,.4f})")
         lines.append("  6️⃣ Стоп в безубыток после достижения TP1")
 
     lines.append("")
     lines.append(f"📉 <b>RSI:</b> <code>{a['rsi_1h']} (1H)</code> | <code>{a['rsi_4h']} (4H)</code>")
     lines.append(f"📊 <b>MACD:</b> <code>{a['macd']}</code> | Signal: <code>{a['macd_signal']}</code>")
     lines.append(f"📦 <b>Всплеск объёма:</b> <code>x{a['volume_spike']}</code>")
-    lines.append(f"📏 <b>ATR:</b> <code>${a['atr']}</code>")
+    lines.append(f"📏 <b>ATR:</b> <code>${a['atr']:,.4f}</code>")
     lines.append("")
     lines.append("<b>Уровни:</b>")
-    lines.append(f"  🔺 Сопротивление: <code>${a['resistance']:,.2f}</code>")
-    lines.append(f"  🔻 Поддержка: <code>${a['support']:,.2f}</code>")
-    lines.append(f"  ⬆️ BB Upper: <code>${a['bb_upper']:,.2f}</code>")
-    lines.append(f"  ⬇️ BB Lower: <code>${a['bb_lower']:,.2f}</code>")
+    lines.append(f"  🔺 Сопротивление: <code>${a['resistance']:,.4f}</code>")
+    lines.append(f"  🔻 Поддержка: <code>${a['support']:,.4f}</code>")
+    lines.append(f"  ⬆️ BB Upper: <code>${a['bb_upper']:,.4f}</code>")
+    lines.append(f"  ⬇️ BB Lower: <code>${a['bb_lower']:,.4f}</code>")
     lines.append("")
     lines.append("🔍 <b>Причины сигнала:</b>")
     for r in reasons:
@@ -430,6 +841,8 @@ def format_signal(a: dict) -> str:
     lines.append(f"⏰ <i>Обновлено: {a['timestamp']}</i>")
     lines.append("")
     lines.append("⚠️ <i>Не финансовый совет. Управляй рисками. DYOR!</i>")
+    lines.append("")
+    lines.append("<i>💡 Данные: CoinGecko API</i>")
 
     return "\n".join(lines)
 
@@ -438,12 +851,12 @@ def format_watchlist(analyses: List[dict]) -> str:
     lines = []
     lines.append("📊 <b>ОБЗОР РЫНКА</b>")
     lines.append("")
-    lines.append("<code>АКТИВ    ЦЕНА        24Ч%   RSI   СИГНАЛ  R:R</code>")
-    lines.append("<code>───────────────────────────────────────────</code>")
+    lines.append("<code>АКТИВ    ЦЕНА          24Ч%   RSI   СИГНАЛ  R:R</code>")
+    lines.append("<code>─────────────────────────────────────────────────</code>")
 
     for a in analyses:
         sym = a["symbol"].ljust(6)
-        price = f"${a['price']:,.2f}".rjust(10)
+        price = f"${a['price']:,.4f}".rjust(12)
         change = f"{a['price_change_24h']:+.1f}%".rjust(6)
         rsi = f"{a['rsi_1h']:.0f}".rjust(5)
 
@@ -462,14 +875,16 @@ def format_watchlist(analyses: List[dict]) -> str:
         lines.append(f"<code>{sym} {price} {change} {rsi} {sig.ljust(7)} {rr_str}</code>")
 
     lines.append(f"⏰ <i>{datetime.now().strftime('%d.%m.%Y %H:%M:%S')}</i>")
+    lines.append("")
+    lines.append("<i>💡 Данные: CoinGecko API</i>")
     return "\n".join(lines)
 
 
 # ============ ОБРАБОТЧИКИ КОМАНД ============
 
 def cmd_start(chat_id: int):
-    welcome = ("🤖 <b>Crypto Signal Bot v5.0</b>\n\n"
-        "Я анализирую рынок и даю готовые торговые сигналы с:\n"
+    welcome = ("🤖 <b>Crypto Signal Bot v6.0</b>\n\n"
+        "Я анализирую рынок через <b>CoinGecko API</b> и даю готовые торговые сигналы с:\n"
         "• 🎯 <b>Точкой входа</b>\n"
         "• 🛑 <b>Стоп-лоссом</b>\n"
         "• 💎 <b>3 тейк-профитами</b>\n"
@@ -515,17 +930,17 @@ def cmd_help(chat_id: int):
 
 
 def cmd_signal(chat_id: int, args: list):
-    symbol = (args[0].upper() + "USDT") if args else "BTCUSDT"
+    symbol = args[0].upper() if args else "BTC"
 
-    if symbol not in WATCHLIST and symbol != "BTCUSDT":
-        send_message(chat_id, f"❌ {symbol} не в списке. Используй /watchlist")
+    if symbol not in COIN_MAP:
+        send_message(chat_id, f"❌ {symbol} не найден. Попробуй /watchlist")
         return
 
-    msg = send_message(chat_id, f"🔍 Анализ {symbol.replace('USDT','')}/USDT...")
+    msg = send_message(chat_id, f"🔍 Анализ {symbol}/USDT...")
 
     a = analyze_symbol(symbol)
     if not a:
-        edit_message(chat_id, msg["result"]["message_id"], "❌ Не удалось получить данные")
+        edit_message(chat_id, msg["result"]["message_id"], "❌ Не удалось получить данные. Попробуй позже.")
         return
 
     text = format_signal(a)
@@ -533,7 +948,7 @@ def cmd_signal(chat_id: int, args: list):
     kb = {
         "inline_keyboard": [
             [{"text": "🔄 Обновить", "callback_data": f"signal_{a['symbol']}"}],
-            [{"text": "📊 Binance", "url": f"https://www.binance.com/ru/trade/{a['symbol']}_USDT"}]
+            [{"text": "📊 CoinGecko", "url": f"https://www.coingecko.com/en/coins/{COIN_MAP[a['symbol']]}"}]
         ]
     }
     edit_message(chat_id, msg["result"]["message_id"], text, reply_markup=kb)
@@ -543,10 +958,11 @@ def cmd_signals(chat_id: int):
     msg = send_message(chat_id, "🔍 Ищу сигналы...")
 
     analyses = []
-    for s in WATCHLIST:
+    for s in WATCHLIST[:15]:  # Ограничиваем для скорости
         a = analyze_symbol(s)
         if a and a["signal"] in ["BUY", "SELL"]:
             analyses.append(a)
+        time.sleep(0.1)  # Rate limiting
 
     analyses.sort(key=lambda x: x["signal_strength"], reverse=True)
 
@@ -566,7 +982,7 @@ def cmd_signals(chat_id: int):
         tp1 = levels.get("take_profit_1", 0)
 
         lines.append(f"{emoji} <b>{a['symbol']}</b> {stars} | R:R 1:{rr}")
-        lines.append(f"   Вход: ${entry:,.2f} | SL: ${sl:,.2f} | TP1: ${tp1:,.2f}")
+        lines.append(f"   Вход: ${entry:,.4f} | SL: ${sl:,.4f} | TP1: ${tp1:,.4f}")
         lines.append(f"   RSI: {a['rsi_1h']} | 24ч: {a['price_change_24h']:+.1f}%")
         lines.append("")
 
@@ -578,12 +994,13 @@ def cmd_watchlist(chat_id: int):
     msg = send_message(chat_id, "📊 Загружаю рынок...")
 
     analyses = []
-    for s in WATCHLIST:
+    for s in WATCHLIST[:20]:  # Ограничиваем для скорости
         a = analyze_symbol(s)
         if a:
             analyses.append(a)
+        time.sleep(0.1)
 
-    analyses.sort(key=lambda x: x["quote_volume_24h"], reverse=True)
+    analyses.sort(key=lambda x: x.get("quote_volume_24h", 0), reverse=True)
 
     text = format_watchlist(analyses)
 
@@ -594,38 +1011,41 @@ def cmd_watchlist(chat_id: int):
 def cmd_top(chat_id: int):
     msg = send_message(chat_id, "🔝 Ищу топ...")
 
-    tickers = get_all_tickers()
-    if not tickers:
-        edit_message(chat_id, msg["result"]["message_id"], "❌ Ошибка")
+    # Получаем топ-100 по market cap
+    markets = cg.get_markets(per_page=100)
+    if not markets:
+        edit_message(chat_id, msg["result"]["message_id"], "❌ Ошибка получения данных")
         return
 
-    usdt = [t for t in tickers if t["symbol"].endswith("USDT") and float(t["quoteVolume"]) > 1e6]
-    usdt.sort(key=lambda x: abs(float(x["priceChangePercent"])), reverse=True)
+    # Сортируем по абсолютному изменению 24ч
+    markets.sort(key=lambda x: abs(x.get("price_change_percentage_24h_in_currency", 0) or 0), reverse=True)
 
     lines = ["🔝 <b>ТОП-10 ДВИЖЕНИЙ (24ч)</b>", ""]
 
-    for i, t in enumerate(usdt[:10], 1):
-        sym = t["symbol"].replace("USDT", "")
-        change = float(t["priceChangePercent"])
-        price = float(t["lastPrice"])
-        vol = float(t["quoteVolume"])
+    for i, t in enumerate(markets[:10], 1):
+        sym = t["symbol"].upper()
+        change = t.get("price_change_percentage_24h_in_currency", 0) or 0
+        price = t.get("current_price", 0)
+        vol = t.get("total_volume", 0)
+        mc = t.get("market_cap", 0)
         emoji = "🚀" if change > 10 else "📈" if change > 0 else "💥" if change < -10 else "📉"
 
         lines.append(f"{i}. {emoji} <b>{sym}</b>")
-        lines.append(f"   ${price:,.4f} | {change:+.2f}% | Объём: ${vol/1e6:.1f}M")
+        lines.append(f"   ${price:,.4f} | {change:+.2f}% | Объём: ${vol/1e6:.1f}M | Кап: ${mc/1e9:.1f}B")
         lines.append("")
 
     edit_message(chat_id, msg["result"]["message_id"], "\n".join(lines))
 
 
 def cmd_scanner(chat_id: int):
-    msg = send_message(chat_id, "🔍 Сканирую рынок на лучшие сигналы...\nЭто может занять 10-15 секунд...")
+    msg = send_message(chat_id, "🔍 Сканирую рынок на лучшие сигналы...\nЭто может занять 20-30 секунд...")
 
     results = []
-    for s in WATCHLIST:
+    for s in WATCHLIST[:15]:
         a = analyze_symbol(s)
         if a:
             results.append(a)
+        time.sleep(0.1)
 
     good_signals = []
     for r in results:
@@ -647,9 +1067,9 @@ def cmd_scanner(chat_id: int):
         levels = a["levels"]
         stars = "⭐" * a["signal_strength"]
         lines.append(f"🟢 <b>{a['symbol']}</b> {stars} | R:R 1:{levels['risk_reward_1']}")
-        lines.append(f"   🎯 Вход: ${levels['entry']:,.2f}")
-        lines.append(f"   🛑 Стоп: ${levels['stop_loss']:,.2f} ({abs((levels['stop_loss']-levels['entry'])/levels['entry']*100):.1f}%)")
-        lines.append(f"   💎 TP1: ${levels['take_profit_1']:,.2f} | TP2: ${levels['take_profit_2']:,.2f} | TP3: ${levels['take_profit_3']:,.2f}")
+        lines.append(f"   🎯 Вход: ${levels['entry']:,.4f}")
+        lines.append(f"   🛑 Стоп: ${levels['stop_loss']:,.4f} ({abs((levels['stop_loss']-levels['entry'])/levels['entry']*100):.1f}%)")
+        lines.append(f"   💎 TP1: ${levels['take_profit_1']:,.4f} | TP2: ${levels['take_profit_2']:,.4f} | TP3: ${levels['take_profit_3']:,.4f}")
         lines.append(f"   RSI: {a['rsi_1h']} | Объём: x{a['volume_spike']}")
         lines.append("")
 
@@ -663,9 +1083,10 @@ def cmd_scanner(chat_id: int):
 
 
 def cmd_status(chat_id: int):
-    status = (f"🤖 <b>Статус бота v5.0</b>\n\n"
+    status = (f"🤖 <b>Статус бота v6.0</b>\n\n"
         f"✅ Онлайн\n"
-        f"📡 Binance Spot API\n"
+        f"📡 CoinGecko API\n"
+        f"🔑 API Key: {'✅ Да' if CG_API_KEY else '❌ Нет (keyless)'}\n"
         f"📊 Пар: {len(WATCHLIST)}\n\n"
         f"<b>Настройки:</b>\n"
         f"• RSI: {SIGNAL_CONFIG['rsi_oversold']}-{SIGNAL_CONFIG['rsi_overbought']}\n"
@@ -686,22 +1107,27 @@ def handle_callback(query: dict):
     tg_post("answerCallbackQuery", {"callback_query_id": query["id"], "text": "Обрабатываю..."})
 
     if data.startswith("signal_"):
-        symbol = data.split("_")[1].upper() + "USDT"
+        symbol = data.split("_")[1].upper()
         a = analyze_symbol(symbol)
         if a:
             text = format_signal(a)
             kb = {
                 "inline_keyboard": [
                     [{"text": "🔄 Обновить", "callback_data": f"signal_{a['symbol']}"}],
-                    [{"text": "📊 Binance", "url": f"https://www.binance.com/ru/trade/{a['symbol']}_USDT"}]
+                    [{"text": "📊 CoinGecko", "url": f"https://www.coingecko.com/en/coins/{COIN_MAP.get(a['symbol'], '')}"}]
                 ]
             }
             edit_message(chat_id, message_id, text, reply_markup=kb)
 
     elif data == "watchlist":
-        analyses = [analyze_symbol(s) for s in WATCHLIST]
+        analyses = []
+        for s in WATCHLIST[:20]:
+            a = analyze_symbol(s)
+            if a:
+                analyses.append(a)
+            time.sleep(0.1)
         analyses = [r for r in analyses if r]
-        analyses.sort(key=lambda x: x["quote_volume_24h"], reverse=True)
+        analyses.sort(key=lambda x: x.get("quote_volume_24h", 0), reverse=True)
         text = format_watchlist(analyses)
         kb = {"inline_keyboard": [[{"text": "🔄 Обновить", "callback_data": "watchlist"}]]}
         edit_message(chat_id, message_id, text, reply_markup=kb)
@@ -748,7 +1174,7 @@ def handle_message(msg: dict):
 
 @app.route('/')
 def index():
-    return 'Crypto Signal Bot v5.0 is running!'
+    return 'Crypto Signal Bot v6.0 (CoinGecko) is running!'
 
 
 @app.route('/webhook', methods=['POST'])
@@ -770,7 +1196,7 @@ def webhook():
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "bot": "running"})
+    return jsonify({"status": "ok", "bot": "running", "api": "coingecko"})
 
 
 # ============ ЗАПУСК ============
@@ -779,19 +1205,16 @@ def init_webhook():
     """Установить webhook при старте"""
     if WEBHOOK_URL:
         webhook_full_url = f"{WEBHOOK_URL}/webhook"
-        # Удаляем старый webhook
         delete_webhook()
-        # Устанавливаем новый
         result = set_webhook(webhook_full_url)
         logger.info(f"Webhook URL: {webhook_full_url}")
         logger.info(f"Webhook result: {result}")
 
 
 if __name__ == "__main__":
-    # Устанавливаем webhook в отдельном потоке
     threading.Thread(target=init_webhook, daemon=True).start()
 
-    # Запускаем Flask
     port = int(os.environ.get("PORT", 8080))
-    logger.info(f"Запуск Crypto Signal Bot v5.0 на порту {port}...")
+    logger.info(f"🚀 Запуск Crypto Signal Bot v6.0 (CoinGecko) на порту {port}...")
+    logger.info(f"📡 API Key: {'✅' if CG_API_KEY else '❌ Keyless (rate limit ~30 req/min)'}")
     app.run(host="0.0.0.0", port=port)
