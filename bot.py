@@ -1,5 +1,5 @@
 """
-Crypto Signal Bot v7.7 — Исправлен async Bot.send_message
+Crypto Signal Bot v7.8 — Только polling, webhook отключён
 """
 
 import os
@@ -23,9 +23,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
+
+# ИГНОРИРУЕМ WEBHOOK_URL даже если есть
+WEBHOOK_URL = None  # Принудительно отключаем webhook
 
 logger.info(f"🔍 TOKEN length: {len(TOKEN)}")
 
@@ -277,13 +279,11 @@ def get_main_menu():
         ["🔔 Алерты", "📈 Статистика"], ["📚 Помощь"]
     ], resize_keyboard=True)
 
-# ==================== ASYNC ОБРАБОТЧИКИ ====================
-# Создаём event loop для async операций
+# ==================== ASYNC ====================
 _loop = asyncio.new_event_loop()
 asyncio.set_event_loop(_loop)
 
 def send_message_sync(bot, chat_id, text, **kwargs):
-    """Синхронная обёртка для async send_message"""
     try:
         future = asyncio.run_coroutine_threadsafe(
             bot.send_message(chat_id=chat_id, text=text, **kwargs),
@@ -294,6 +294,7 @@ def send_message_sync(bot, chat_id, text, **kwargs):
         logger.error(f"send_message error: {e}")
         return None
 
+# ==================== ОБРАБОТЧИКИ ====================
 def handle_start(bot, chat_id, user):
     conn = get_db()
     c = conn.cursor()
@@ -303,7 +304,7 @@ def handle_start(bot, chat_id, user):
     conn.commit()
     conn.close()
     
-    send_message_sync(bot, chat_id, f"👋 Привет, {user.first_name}!\n\n🤖 Crypto Signal Bot v7.7\n\nВыбери действие 👇",
+    send_message_sync(bot, chat_id, f"👋 Привет, {user.first_name}!\n\n🤖 Crypto Signal Bot v7.8\n\nВыбери действие 👇",
                       parse_mode="HTML", reply_markup=get_main_menu())
 
 def handle_signal(bot, chat_id, args):
@@ -410,26 +411,18 @@ def auto_scanner():
             logger.error(f"Scan error: {e}")
         time.sleep(SIGNAL_CONFIG["scan_interval"])
 
-# ==================== FLASK ====================
+# ==================== FLASK (только для health-check) ====================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot v7.7 running!"
+    return "Bot v7.8 running (polling mode)!"
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    logger.info(f"📩 POST /webhook")
-    try:
-        data = request.get_json(force=True)
-        logger.info(f"📨 {str(data)[:200]}")
-        threading.Thread(target=process_update, args=(bot, data), daemon=True).start()
-        return jsonify({"ok": True})
-    except Exception as e:
-        logger.error(f"❌ Webhook: {e}")
-        return jsonify({"ok": False}), 500
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok", "version": "7.8", "mode": "polling"})
 
-# ==================== MAIN ====================
+# ==================== MAIN — ТОЛЬКО POLLING ====================
 def main():
     global bot
     
@@ -439,40 +432,42 @@ def main():
     init_db()
     bot = telegram.Bot(TOKEN)
     
-    # Webhook setup
-    webhook_ok = False
-    if WEBHOOK_URL:
-        try:
-            wh = f"{WEBHOOK_URL}/webhook"
-            requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook", timeout=10)
-            time.sleep(1)
-            r = requests.get(f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={wh}", timeout=10)
-            logger.info(f"Webhook: {r.status_code} {r.text[:100]}")
-            if r.status_code == 200 and r.json().get("ok"):
-                webhook_ok = True
-                logger.info("✅ Webhook mode")
-        except Exception as e:
-            logger.error(f"Webhook failed: {e}")
+    # Удаляем webhook принудительно
+    logger.info("🔄 Удаляем webhook...")
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=10)
+        logger.info(f"deleteWebhook: {r.status_code} {r.text[:100]}")
+    except Exception as e:
+        logger.error(f"deleteWebhook error: {e}")
     
+    # Запускаем сканер
     scanner_thread = threading.Thread(target=auto_scanner, daemon=True)
     scanner_thread.start()
+    logger.info("✅ Сканер запущен")
     
-    if webhook_ok:
+    # Запускаем Flask в отдельном потоке (для Render health-check)
+    def run_flask():
         port = int(os.environ.get("PORT", 10000))
         app.run(host="0.0.0.0", port=port)
-    else:
-        logger.info("🔄 Polling mode")
-        requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=10)
-        offset = 0
-        while True:
-            try:
-                updates = bot.get_updates(offset=offset, timeout=30)
-                for u in updates:
-                    offset = u.update_id + 1
-                    process_update(bot, u.to_dict())
-            except Exception as e:
-                logger.error(f"Polling: {e}")
-                time.sleep(5)
+    
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("✅ Flask запущен (health-check)")
+    
+    # POLLING — основной цикл
+    logger.info("🔄 POLLING MODE — запрашиваем сообщения...")
+    offset = 0
+    while True:
+        try:
+            updates = bot.get_updates(offset=offset, timeout=30)
+            if updates:
+                logger.info(f"📩 Получено {len(updates)} сообщений")
+            for u in updates:
+                offset = u.update_id + 1
+                process_update(bot, u.to_dict())
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
