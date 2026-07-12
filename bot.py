@@ -1,5 +1,5 @@
 """
-Crypto Signal Bot v7.9 — HTTP API напрямую, без async
+Crypto Signal Bot v7.10 — Исправлено отправка сообщений
 """
 
 import os
@@ -25,7 +25,6 @@ COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
 
 logger.info(f"🔍 TOKEN length: {len(TOKEN)}")
 
-# Проверяем токен
 if TOKEN:
     try:
         resp = requests.get(f"https://api.telegram.org/bot{TOKEN}/getMe", timeout=10)
@@ -34,7 +33,6 @@ if TOKEN:
     except Exception as e:
         logger.error(f"getMe error: {e}")
 
-# CoinGecko
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 HEADERS = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
 
@@ -61,48 +59,37 @@ SIGNAL_STARS = {
 # ==================== TELEGRAM HTTP API ====================
 TG_API = f"https://api.telegram.org/bot{TOKEN}"
 
-def tg_get(method, params=None):
-    """GET запрос к Telegram API"""
-    try:
-        resp = requests.get(f"{TG_API}/{method}", params=params, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("ok"):
-                return data.get("result")
-            else:
-                logger.error(f"TG API error: {data}")
-        else:
-            logger.error(f"TG HTTP {resp.status_code}: {resp.text[:200]}")
-    except Exception as e:
-        logger.error(f"TG request error: {e}")
-    return None
-
-def tg_post(method, payload):
-    """POST запрос к Telegram API"""
-    try:
-        resp = requests.post(f"{TG_API}/{method}", json=payload, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("ok"):
-                return data.get("result")
-            else:
-                logger.error(f"TG API error: {data}")
-        else:
-            logger.error(f"TG HTTP {resp.status_code}: {resp.text[:200]}")
-    except Exception as e:
-        logger.error(f"TG request error: {e}")
-    return None
-
 def send_message(chat_id, text, parse_mode="HTML", reply_markup=None):
-    """Отправить сообщение"""
+    """Отправить сообщение через HTTP API"""
     payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": parse_mode
     }
     if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return tg_post("sendMessage", payload)
+        payload["reply_markup"] = json.dumps(reply_markup)
+    
+    logger.info(f"📤 Отправка в {chat_id}: {text[:50]}...")
+    
+    try:
+        resp = requests.post(f"{TG_API}/sendMessage", json=payload, timeout=10)
+        logger.info(f"📤 Response status: {resp.status_code}")
+        logger.info(f"📤 Response body: {resp.text[:300]}")
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("ok"):
+                logger.info(f"✅ Сообщение отправлено!")
+                return data.get("result")
+            else:
+                logger.error(f"❌ TG API error: {data}")
+        else:
+            logger.error(f"❌ TG HTTP {resp.status_code}: {resp.text[:300]}")
+    except Exception as e:
+        logger.error(f"❌ send_message exception: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+    return None
 
 def get_updates(offset=0, limit=100):
     """Получить обновления (polling)"""
@@ -349,27 +336,31 @@ def handle_start(chat_id, user):
     conn.commit()
     conn.close()
     
-    send_message(chat_id, f"👋 Привет, {user.get('first_name', 'друг')}!\n\n🤖 Crypto Signal Bot v7.9\n\nВыбери действие 👇",
-                 reply_markup=get_main_menu())
+    # Сначала без reply_markup для проверки
+    result = send_message(chat_id, f"👋 Привет, {user.get('first_name', 'друг')}!\n\n🤖 Crypto Signal Bot v7.10\n\nВыбери действие 👇")
+    
+    # Если отправилось — отправляем меню отдельным сообщением
+    if result:
+        send_message(chat_id, "Меню:", reply_markup=get_main_menu())
 
 def handle_signal(chat_id, args):
     if not args:
-        send_message(chat_id, "❌ Укажи монету: /signal BTC", reply_markup=get_main_menu())
+        send_message(chat_id, "❌ Укажи монету: /signal BTC")
         return
     coin = args[0].lower()
     coin_map = {"btc": "bitcoin", "eth": "ethereum", "bnb": "binancecoin", "sol": "solana",
                 "xrp": "ripple", "doge": "dogecoin", "ada": "cardano"}
     coin_id = coin_map.get(coin, coin)
     
-    send_message(chat_id, f"🔍 Анализ {coin.upper()}...", reply_markup=get_main_menu())
+    send_message(chat_id, f"🔍 Анализ {coin.upper()}...")
     signal = analyze_coin(coin_id)
     if signal:
-        send_message(chat_id, format_signal(signal), reply_markup=get_main_menu())
+        send_message(chat_id, format_signal(signal))
     else:
-        send_message(chat_id, "⚠️ Нет сигнала", reply_markup=get_main_menu())
+        send_message(chat_id, "⚠️ Нет сигнала")
 
 def handle_scanner(chat_id):
-    send_message(chat_id, "🔍 Сканирую...", reply_markup=get_main_menu())
+    send_message(chat_id, "🔍 Сканирую...")
     coins = get_top_coins(10)
     found = []
     for c in coins[:5]:
@@ -379,13 +370,13 @@ def handle_scanner(chat_id):
         time.sleep(2)
     
     if not found:
-        send_message(chat_id, "📊 Нет сигналов", reply_markup=get_main_menu())
+        send_message(chat_id, "📊 Нет сигналов")
         return
     
     msg = "🎯 <b>СИГНАЛЫ</b>\n\n"
     for s in found[:3]:
         msg += f"{'🟢' if s['signal']=='BUY' else '🔴'} <b>{s['coin']}</b> {'⭐'*s['stars']}\n"
-    send_message(chat_id, msg, reply_markup=get_main_menu())
+    send_message(chat_id, msg)
 
 def handle_top(chat_id):
     coins = get_top_coins(10)
@@ -393,14 +384,14 @@ def handle_top(chat_id):
     for i, c in enumerate(coins, 1):
         ch = c.get("price_change_percentage_24h", 0) or 0
         msg += f"{i}. <b>{c['symbol'].upper()}</b> ${c['current_price']:,.2f} {'🟢' if ch>=0 else '🔴'} {ch:+.1f}%\n"
-    send_message(chat_id, msg, reply_markup=get_main_menu())
+    send_message(chat_id, msg)
 
 def handle_help(chat_id):
     send_message(chat_id, """📚 <b>ПОМОЩЬ</b>
 /start — начать
 /signal BTC — сигнал
 /scanner — сканер
-/top — топ монет""", reply_markup=get_main_menu())
+/top — топ монет""")
 
 def process_update(update):
     try:
@@ -425,7 +416,7 @@ def process_update(update):
         elif text.startswith("/help"):
             handle_help(chat_id)
         elif "Сигнал" in text:
-            send_message(chat_id, "Введи: /signal BTC", reply_markup=get_main_menu())
+            send_message(chat_id, "Введи: /signal BTC")
         elif "Сканер" in text or "Обзор" in text:
             handle_scanner(chat_id)
         elif "Топ" in text:
@@ -460,11 +451,11 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot v7.9 running (HTTP API polling)!"
+    return "Bot v7.10 running!"
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "version": "7.9"})
+    return jsonify({"status": "ok", "version": "7.10"})
 
 # ==================== MAIN ====================
 def main():
@@ -475,7 +466,11 @@ def main():
     
     # Удаляем webhook
     logger.info("🔄 Удаляем webhook...")
-    tg_get("deleteWebhook", {"drop_pending_updates": "true"})
+    try:
+        resp = requests.get(f"{TG_API}/deleteWebhook?drop_pending_updates=true", timeout=10)
+        logger.info(f"deleteWebhook: {resp.status_code} {resp.text[:100]}")
+    except Exception as e:
+        logger.error(f"deleteWebhook error: {e}")
     
     # Запускаем сканер
     scanner_thread = threading.Thread(target=auto_scanner, daemon=True)
@@ -491,7 +486,7 @@ def main():
     flask_thread.start()
     logger.info("✅ Flask запущен")
     
-    # POLLING через HTTP API
+    # POLLING
     logger.info("🔄 POLLING MODE")
     offset = 0
     while True:
@@ -503,7 +498,6 @@ def main():
                     offset = u["update_id"] + 1
                     process_update(u)
             else:
-                # Нет сообщений — короткая пауза
                 time.sleep(1)
         except Exception as e:
             logger.error(f"Polling error: {e}")
