@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-Crypto Signal Bot v6.2 — CoinGecko + Telegram через прокси
-Решает проблему блокировки api.telegram.org на Railway
+Crypto Signal Bot v6.4 — CoinGecko API (минимальная стабильная версия)
+Фикс: ленивая загрузка, маленький watchlist, задержки между запросами
 """
 
 import os
 import logging
 import threading
 import time
-import json
-import socket
 from datetime import datetime
 from typing import Optional, List, Dict, Tuple
-from urllib.parse import urlencode
 
 import requests
 from flask import Flask, request, jsonify
@@ -22,20 +19,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 CG_API_KEY = os.environ.get("CG_API_KEY", "")
 CG_BASE_URL = "https://api.coingecko.com/api/v3"
+USE_POLLING = os.environ.get("USE_POLLING", "true").lower() == "true"
 
-# Прокси для Telegram (если api.telegram.org блокируется)
-# Форматы: "http://user:pass@host:port" или "socks5://host:port"
-TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "")
-
-# Альтернативные Telegram API endpoints (если основной не работает)
-TELEGRAM_API_ENDPOINTS = [
-    f"https://api.telegram.org/bot{BOT_TOKEN}",
-    f"https://api.telegram.org/bot{BOT_TOKEN}",  # дубль для retry
-]
-
-USE_POLLING = os.environ.get("USE_POLLING", "true").lower() == "true"  # По умолчанию polling
-
-# Маппинг символов
+# Минимальный watchlist для стабильной работы без API key
 COIN_MAP = {
     "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "ripple",
     "DOGE": "dogecoin", "ADA": "cardano", "DOT": "polkadot", "LINK": "chainlink",
@@ -74,19 +60,10 @@ COIN_MAP = {
     "APU": "apu-apustaja", "BOBO": "bobo",
 }
 
+# Маленький watchlist для стабильной работы без API key
 WATCHLIST = [
-    "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "DOT", "LINK", "AVAX", "MATIC",
-    "BNB", "UNI", "LTC", "ATOM", "NEAR", "APT", "ARB", "OP", "SUI", "SEI",
-    "TIA", "INJ", "RENDER", "FET", "PEPE", "SHIB", "WLD", "STRK", "IMX", "GRT",
-    "AAVE", "MKR", "LDO", "CRV", "SNX", "COMP", "YFI", "1INCH", "DYDX", "SUSHI",
-    "BAL", "FXS", "CVX", "GMX", "RDNT", "MAGIC", "WIF", "BONK", "FLOKI", "MEME",
-    "TURBO", "PEOPLE", "TRB", "PENDLE", "EIGEN", "ETHFI", "REZ", "SAGA", "OMNI",
-    "DYM", "MANTA", "ALT", "PIXEL", "PORTAL", "AEVO", "W", "ZK", "MNT", "KAS",
-    "TAO", "RNDR", "AGIX", "OCEAN", "FIL", "AR", "XMR", "BCH", "XLM", "ALGO",
-    "XTZ", "TRX", "VET", "ICP", "THETA", "CHZ", "SAND", "MANA", "AXS", "GALA",
-    "GMT", "PRIME", "RON", "SUPER", "ZETA", "DEGEN", "AERO", "VELO", "CAKE", "JOE",
-    "BANANA", "MAV", "BOME", "SLERF", "MEW", "POPCAT", "MOG", "BRETT", "ANDY",
-    "APU", "BOBO",
+    "BTC", "ETH", "SOL", "XRP", "DOGE",
+    "ADA", "DOT", "LINK", "AVAX", "MATIC",
 ]
 
 SIGNAL_CONFIG = {
@@ -99,53 +76,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+session = requests.Session()
 
-# ============ PROXY SETUP ============
-
-def get_telegram_session():
-    """Создаёт сессию с прокси если нужно"""
-    s = requests.Session()
-    if TELEGRAM_PROXY:
-        s.proxies = {
-            "http": TELEGRAM_PROXY,
-            "https": TELEGRAM_PROXY,
-        }
-        logger.info(f"🔌 Telegram proxy: {TELEGRAM_PROXY[:20]}...")
-
-    # Увеличиваем таймауты для Railway
-    s.timeout = (10, 30)  # (connect, read)
-    return s
-
-
-tg_session = get_telegram_session()
-
-# ============ RATE LIMITER ============
-
-class RateLimiter:
-    def __init__(self, max_requests: int, window_seconds: int):
-        self.max_requests = max_requests
-        self.window = window_seconds
-        self.tokens = max_requests
-        self.last_update = time.time()
-        self.lock = threading.Lock()
-
-    def acquire(self):
-        with self.lock:
-            now = time.time()
-            elapsed = now - self.last_update
-            self.tokens = min(self.max_requests, self.tokens + elapsed * (self.max_requests / self.window))
-            self.last_update = now
-            if self.tokens < 1:
-                sleep_time = (1 - self.tokens) * (self.window / self.max_requests)
-                logger.info(f"Rate limit: sleeping {sleep_time:.2f}s")
-                time.sleep(sleep_time)
-                self.tokens = 0
-            else:
-                self.tokens -= 1
-
-rate_limiter = RateLimiter(max_requests=100 if CG_API_KEY else 25, window_seconds=60)
-
-# ============ COINGECKO API ============
+# ============ COINGECKO API (с задержками) ============
 
 class CoinGeckoAPI:
     def __init__(self, api_key: str = ""):
@@ -156,10 +89,13 @@ class CoinGeckoAPI:
             self.session.headers.update({"x-cg-demo-api-key": api_key})
             logger.info("✅ CoinGecko API Key активирован (100 req/min)")
         else:
-            logger.info("⚠️ CoinGecko без API Key (25 req/min)")
+            logger.info("⚠️ CoinGecko без API Key (10-30 req/min)")
 
     def _get(self, endpoint: str, params: dict = None) -> Optional[dict]:
-        rate_limiter.acquire()
+        # Задержка перед каждым запросом (без ключа: 2s, с ключом: 0.1s)
+        delay = 2.0 if not self.api_key else 0.1
+        time.sleep(delay)
+
         try:
             url = f"{self.base_url}/{endpoint}"
             resp = self.session.get(url, params=params, timeout=20)
@@ -228,16 +164,15 @@ class Cache:
             self._cache[key] = (data, time.time())
 
 
-cache = Cache(ttl=45)
+cache = Cache(ttl=60)
 
-# ============ TELEGRAM API (с прокси и retry) ============
+# ============ TELEGRAM API ============
 
-def tg_post(method: str, json_data: dict = None, retries: int = 5) -> Optional[dict]:
-    """Отправка запроса в Telegram с retry и прокси"""
+def tg_post(method: str, json_data: dict = None, retries: int = 3) -> Optional[dict]:
     for attempt in range(retries):
         try:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-            resp = tg_session.post(url, json=json_data, timeout=(10, 30))
+            resp = session.post(url, json=json_data, timeout=(10, 30))
 
             if resp.status_code == 200:
                 data = resp.json()
@@ -250,21 +185,13 @@ def tg_post(method: str, json_data: dict = None, retries: int = 5) -> Optional[d
                 retry_after = int(resp.headers.get('Retry-After', 5))
                 logger.warning(f"Telegram rate limit, retry after {retry_after}s")
                 time.sleep(retry_after)
-            elif resp.status_code == 400:
-                logger.error(f"Telegram Bad Request: {resp.text[:500]}")
+            elif resp.status_code == 409:
+                logger.error(f"Telegram Conflict (409): Another instance is polling")
                 return None
             else:
                 logger.error(f"Telegram HTTP {resp.status_code}: {resp.text[:200]}")
                 if attempt < retries - 1:
                     time.sleep(2 ** attempt)
-        except requests.exceptions.Timeout:
-            logger.error(f"⏱️ Telegram timeout (attempt {attempt+1})")
-            if attempt < retries - 1:
-                time.sleep(5)
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"🔌 Telegram connection error (attempt {attempt+1}): {e}")
-            if attempt < retries - 1:
-                time.sleep(5)
         except Exception as e:
             logger.error(f"Telegram error (attempt {attempt+1}): {e}")
             if attempt < retries - 1:
@@ -305,7 +232,6 @@ def get_updates(offset: int = 0, limit: int = 100, timeout: int = 30) -> Optiona
 # ============ POLLING MODE ============
 
 def polling_loop():
-    """Polling с обработкой ошибок и реконнектом"""
     logger.info("🔄 Запущен polling mode")
     offset = 0
     consecutive_errors = 0
@@ -718,7 +644,7 @@ def format_watchlist(analyses: List[dict]) -> str:
 # ============ ОБРАБОТЧИКИ КОМАНД ============
 
 def cmd_start(chat_id: int):
-    welcome = ("🤖 <b>Crypto Signal Bot v6.2</b>\n\n"
+    welcome = ("🤖 <b>Crypto Signal Bot v6.4</b>\n\n"
         "Я анализирую рынок через <b>CoinGecko API</b> и даю готовые торговые сигналы с:\n"
         "• 🎯 <b>Точкой входа</b>\n"
         "• 🛑 <b>Стоп-лоссом</b>\n"
@@ -782,7 +708,7 @@ def cmd_signal(chat_id: int, args: list):
 def cmd_signals(chat_id: int):
     msg = send_message(chat_id, "🔍 Ищу сигналы...")
     analyses = []
-    for s in WATCHLIST[:15]:
+    for s in WATCHLIST[:10]:
         a = analyze_symbol(s)
         if a and a["signal"] in ["BUY", "SELL"]:
             analyses.append(a)
@@ -810,7 +736,7 @@ def cmd_signals(chat_id: int):
 def cmd_watchlist(chat_id: int):
     msg = send_message(chat_id, "📊 Загружаю рынок...")
     analyses = []
-    for s in WATCHLIST[:20]:
+    for s in WATCHLIST[:10]:
         a = analyze_symbol(s)
         if a:
             analyses.append(a)
@@ -844,7 +770,7 @@ def cmd_top(chat_id: int):
 def cmd_scanner(chat_id: int):
     msg = send_message(chat_id, "🔍 Сканирую рынок...\nЭто может занять 20-30 секунд...")
     results = []
-    for s in WATCHLIST[:15]:
+    for s in WATCHLIST[:10]:
         a = analyze_symbol(s)
         if a:
             results.append(a)
@@ -877,7 +803,7 @@ def cmd_scanner(chat_id: int):
 
 
 def cmd_status(chat_id: int):
-    status = (f"🤖 <b>Статус бота v6.2</b>\n\n"
+    status = (f"🤖 <b>Статус бота v6.4</b>\n\n"
         f"✅ Онлайн\n"
         f"📡 CoinGecko API\n"
         f"🔑 API Key: {'✅ Да' if CG_API_KEY else '❌ Нет (keyless)'}\n"
@@ -910,7 +836,7 @@ def handle_callback(query: dict):
             ]}
             edit_message(chat_id, message_id, text, reply_markup=kb)
     elif data == "watchlist":
-        analyses = [analyze_symbol(s) for s in WATCHLIST[:20]]
+        analyses = [analyze_symbol(s) for s in WATCHLIST[:10]]
         analyses = [r for r in analyses if r]
         analyses.sort(key=lambda x: x.get("quote_volume_24h", 0), reverse=True)
         edit_message(chat_id, message_id, format_watchlist(analyses),
@@ -953,7 +879,7 @@ def handle_message(msg: dict):
 
 @app.route('/')
 def index():
-    return 'Crypto Signal Bot v6.2 (CoinGecko) is running!'
+    return 'Crypto Signal Bot v6.4 (CoinGecko) is running!'
 
 
 @app.route('/webhook', methods=['POST'])
@@ -972,23 +898,22 @@ def webhook():
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "bot": "running", "api": "coingecko", "version": "6.2"})
+    return jsonify({"status": "ok", "bot": "running", "api": "coingecko", "version": "6.4"})
 
 
 # ============ ЗАПУСК ============
 
 def init_bot():
     if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN не задан! Установи переменную окружения BOT_TOKEN")
+        logger.error("❌ BOT_TOKEN не задан!")
         return False
 
-    logger.info("🚀 Запуск Crypto Signal Bot v6.2 (CoinGecko)...")
-    logger.info(f"📡 CoinGecko API Key: {'✅' if CG_API_KEY else '❌ Keyless (25 req/min)'}")
+    logger.info("🚀 Запуск Crypto Signal Bot v6.4 (CoinGecko)...")
+    logger.info(f"📡 CoinGecko API Key: {'✅' if CG_API_KEY else '❌ Keyless (2s delay)'}")
     logger.info(f"🔄 Mode: {'Polling' if USE_POLLING else 'Webhook'}")
-    logger.info(f"🔌 Telegram Proxy: {'✅' if TELEGRAM_PROXY else '❌ Нет'}")
 
     if USE_POLLING:
-        logger.info("🔄 Запуск polling в отдельном потоке...")
+        logger.info("🔄 Запуск polling...")
         threading.Thread(target=polling_loop, daemon=True).start()
         return True
 
@@ -1000,16 +925,13 @@ def init_bot():
     webhook_full_url = f"{WEBHOOK_URL}/webhook"
     logger.info(f"🔧 Настройка webhook: {webhook_full_url}")
 
-    # Проверяем текущий webhook
     info = get_webhook_info()
     if info:
         logger.info(f"📡 Текущий webhook: {info.get('result', {})}")
 
-    # Удаляем старый
     delete_webhook()
     time.sleep(1)
 
-    # Устанавливаем новый
     result = set_webhook(webhook_full_url)
     if result and result.get("ok"):
         logger.info(f"✅ Webhook установлен: {webhook_full_url}")
