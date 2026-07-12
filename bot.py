@@ -89,8 +89,7 @@ def init_db():
         stars INTEGER,
         rsi REAL,
         change_24h REAL,
-        sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(coin, signal_type, entry, sent_at)
+        sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
     
     # Алерты
@@ -98,20 +97,22 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         coin TEXT,
-        condition TEXT,  -- above/below
+        condition TEXT,
         target_price REAL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         triggered INTEGER DEFAULT 0
     )''')
     
     # Отправленные сигналы (для отслеживания повторов)
+    # Используем date_text вместо DATE(sent_at) — SQLite не поддерживает выражения в UNIQUE
     c.execute('''CREATE TABLE IF NOT EXISTS sent_signals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         coin TEXT,
         signal_type TEXT,
         stars INTEGER,
         sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(coin, signal_type, DATE(sent_at))
+        date_text TEXT DEFAULT (date('now')),
+        UNIQUE(coin, signal_type, date_text)
     )''')
     
     conn.commit()
@@ -730,9 +731,9 @@ def should_send_signal(coin, signal_type, stars):
     
     today = datetime.now().strftime("%Y-%m-%d")
     
-    # Проверяем, отправляли ли сегодня
+    # Проверяем, отправляли ли сегодня (используем date_text)
     c.execute('''SELECT 1 FROM sent_signals 
-                 WHERE coin = ? AND signal_type = ? AND DATE(sent_at) = ?''',
+                 WHERE coin = ? AND signal_type = ? AND date_text = ?''',
               (coin, signal_type, today))
     
     was_sent = c.fetchone() is not None
@@ -740,18 +741,20 @@ def should_send_signal(coin, signal_type, stars):
     # 4-5 звёзд — отправляем всегда (повторно)
     if stars >= 4:
         # Обновляем время отправки
-        c.execute('''INSERT OR REPLACE INTO sent_signals (coin, signal_type, stars, sent_at)
-                     VALUES (?, ?, ?, ?)''',
-                  (coin, signal_type, stars, datetime.now()))
+        c.execute('''INSERT OR REPLACE INTO sent_signals 
+                     (coin, signal_type, stars, sent_at, date_text)
+                     VALUES (?, ?, ?, ?, ?)''',
+                  (coin, signal_type, stars, datetime.now(), today))
         conn.commit()
         conn.close()
         return True
     
     # 1-3 звёзд — отправляем один раз в день
     if not was_sent:
-        c.execute('''INSERT INTO sent_signals (coin, signal_type, stars, sent_at)
-                     VALUES (?, ?, ?, ?)''',
-                  (coin, signal_type, stars, datetime.now()))
+        c.execute('''INSERT INTO sent_signals 
+                     (coin, signal_type, stars, sent_at, date_text)
+                     VALUES (?, ?, ?, ?, ?)''',
+                  (coin, signal_type, stars, datetime.now(), today))
         conn.commit()
         conn.close()
         return True
