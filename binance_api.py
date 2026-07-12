@@ -1,7 +1,8 @@
 """
-CryptoCompare API Integration Module
-Публичные endpoints — не требуют API ключ для базовых запросов
-Бесплатный план: 100k запросов/месяц, 100 запросов/мин
+CryptoCompare API Integration Module v2
+Публичные endpoints -- не требуют API ключ для базовых запросов
+Бесплатный план: 100k запросов/месяц, ~100 запросов/мин
+v2: добавлено кэширование, rate limiting, уменьшено количество запросов
 """
 
 import os
@@ -9,12 +10,22 @@ import json
 import time
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
 CC_BASE = "https://min-api.cryptocompare.com/data"
 CC_API_KEY = os.environ.get("CRYPTOCOMPARE_API_KEY", "")
+
+# Rate limiting: минимальный интервал между запросами (сек)
+MIN_REQUEST_INTERVAL = 0.7  # ~85 запросов/мин с запасом
+_last_request_time = 0
+
+# Кэш: {cache_key: (timestamp, data)}
+_cache = {}
+CACHE_TTL_SHORT = 30      # 30 сек для цен
+CACHE_TTL_MEDIUM = 300    # 5 мин для OHLCV
+CACHE_TTL_LONG = 600      # 10 мин для статистики
 
 # Маппинг символов: coin_id -> CryptoCompare символ
 SYMBOL_MAP = {
@@ -54,8 +65,42 @@ SYMBOL_MAP = {
 }
 
 
-def _cc_get(endpoint, params=None):
-    """Безопасный GET запрос к CryptoCompare API"""
+def _rate_limit():
+    """Ограничение скорости запросов"""
+    global _last_request_time
+    now = time.time()
+    elapsed = now - _last_request_time
+    if elapsed < MIN_REQUEST_INTERVAL:
+        sleep_time = MIN_REQUEST_INTERVAL - elapsed
+        time.sleep(sleep_time)
+    _last_request_time = time.time()
+
+
+def _get_cache(key, ttl):
+    """Получить данные из кэша если они ещё актуальны"""
+    if key in _cache:
+        timestamp, data = _cache[key]
+        if time.time() - timestamp < ttl:
+            return data
+    return None
+
+
+def _set_cache(key, data):
+    """Сохранить данные в кэш"""
+    _cache[key] = (time.time(), data)
+
+
+def _cc_get(endpoint, params=None, use_cache=False, cache_ttl=60):
+    """Безопасный GET запрос к CryptoCompare API с rate limiting и кэшированием"""
+    cache_key = f"{endpoint}:{json.dumps(params, sort_keys=True) if params else ''}"
+
+    if use_cache:
+        cached = _get_cache(cache_key, cache_ttl)
+        if cached is not None:
+            return cached
+
+    _rate_limit()
+
     url = f"{CC_BASE}{endpoint}"
     headers = {}
     if CC_API_KEY:
@@ -66,12 +111,19 @@ def _cc_get(endpoint, params=None):
         if resp.status_code == 200:
             data = resp.json()
             if data.get("Response") == "Error":
-                logger.error(f"CryptoCompare API error: {data.get('Message', 'Unknown error')}")
+                msg = data.get('Message', 'Unknown error')
+                if "rate limit" in msg.lower():
+                    logger.warning(f"CryptoCompare rate limit hit: {msg}")
+                    time.sleep(3)
+                else:
+                    logger.error(f"CryptoCompare API error: {msg}")
                 return None
+            if use_cache:
+                _set_cache(cache_key, data)
             return data
         elif resp.status_code == 429:
-            logger.warning("CryptoCompare rate limit, sleeping 2s...")
-            time.sleep(2)
+            logger.warning("CryptoCompare HTTP 429 rate limit, sleeping 5s...")
+            time.sleep(5)
             return None
         else:
             logger.error(f"CryptoCompare HTTP {resp.status_code}: {resp.text[:200]}")
@@ -118,7 +170,7 @@ def cc_get_ohlcv(symbol="BTC", interval="hour", limit=100):
         "limit": limit,
     }
 
-    data = _cc_get(endpoint, params)
+    data = _cc_get(endpoint, params, use_cache=True, cache_ttl=CACHE_TTL_MEDIUM)
     if data and "Data" in data and "Data" in data["Data"]:
         return data["Data"]["Data"]
     return None
@@ -131,7 +183,7 @@ def cc_get_ticker_24h(symbol="BTC"):
         "fsyms": fsym,
         "tsyms": "USDT",
     }
-    data = _cc_get("/pricemultifull", params)
+    data = _cc_get("/pricemultifull", params, use_cache=True, cache_ttl=CACHE_TTL_LONG)
     if data and "RAW" in data and fsym in data["RAW"]:
         coin_data = data["RAW"][fsym]["USDT"]
         return {
@@ -152,13 +204,28 @@ def cc_get_price(symbol="BTC"):
     """Получить текущую цену"""
     fsym = _resolve_symbol(symbol)
     params = {
-        "fsyms": fsym,
+        "fsym": fsym,
         "tsyms": "USDT",
     }
-    data = _cc_get("/price", params)
+    data = _cc_get("/price", params, use_cache=True, cache_ttl=CACHE_TTL_SHORT)
     if data and "USDT" in data:
         return float(data["USDT"])
     return None
+
+
+def cc_get_prices_multi(symbols):
+    """Получить цены нескольких монет за 1 запрос (экономия rate limit)"""
+    if not symbols:
+        return {}
+    fsyms = ",".join([_resolve_symbol(s) for s in symbols])
+    params = {
+        "fsyms": fsyms,
+        "tsyms": "USDT",
+    }
+    data = _cc_get("/pricemulti", params, use_cache=True, cache_ttl=CACHE_TTL_SHORT)
+    if data:
+        return {k: float(v.get("USDT", 0)) for k, v in data.items()}
+    return {}
 
 
 def cc_get_top_coins(limit=50):
@@ -167,7 +234,7 @@ def cc_get_top_coins(limit=50):
         "tsym": "USDT",
         "limit": limit,
     }
-    data = _cc_get("/top/mktcapfull", params)
+    data = _cc_get("/top/mktcapfull", params, use_cache=True, cache_ttl=CACHE_TTL_LONG)
     if data and "Data" in data:
         return data["Data"]
     return None
@@ -207,7 +274,6 @@ def analyze_binance_signal(symbol="BTCUSDT", interval="1h"):
     Returns:
         dict или None
     """
-    # Маппинг интервалов
     cc_interval = "hour"
     if interval in ["1d", "1D", "day"]:
         cc_interval = "day"
@@ -234,7 +300,7 @@ def analyze_binance_signal(symbol="BTCUSDT", interval="1h"):
     ema_cross_up = (ema8[-2] <= ema50[-2] and ema8[-1] > ema50[-1])
     ema_cross_down = (ema8[-2] >= ema50[-2] and ema8[-1] < ema50[-1])
 
-    # ATR (упрощённый: средний true range за 14 периодов)
+    # ATR
     atr_values = []
     for i in range(-14, 0):
         tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
@@ -245,7 +311,7 @@ def analyze_binance_signal(symbol="BTCUSDT", interval="1h"):
     support = min(lows[-20:])
     resistance = max(highs[-20:])
 
-    # Объём подтверждение (средний объём за 20 свечей)
+    # Объём подтверждение
     avg_volume = sum(volumes_to[-20:]) / 20
     current_volume = volumes_to[-1]
     volume_confirmed = current_volume > avg_volume * 0.8
@@ -259,7 +325,7 @@ def analyze_binance_signal(symbol="BTCUSDT", interval="1h"):
     if not signal:
         return None
 
-    # Получаем изменение за 24ч
+    # Получаем изменение за 24ч (используем кэш)
     ticker = cc_get_ticker_24h(symbol)
     change_24h = float(ticker.get("CHANGEPCT24HOUR", 0)) if ticker else 0
 
@@ -318,7 +384,6 @@ def analyze_binance_signal(symbol="BTCUSDT", interval="1h"):
 
 
 # ==================== ОБРАТНАЯ СОВМЕСТИМОСТЬ ====================
-# Алиасы для совместимости с bot.py (который импортирует binance_api)
 
 def binance_get_klines(symbol="BTCUSDT", interval="1h", limit=100):
     """Алиас для cc_get_ohlcv -- совместимость с bot.py"""
@@ -373,43 +438,36 @@ def binance_get_price(symbol="BTCUSDT"):
 
 
 def test_binance_connection():
-    """Тест подключения к CryptoCompare API"""
+    """Тест подключения к CryptoCompare API (минимум запросов)"""
     logger.info("=" * 60)
     logger.info("ТЕСТ ПОДКЛЮЧЕНИЯ К CRYPTOCOMPARE API")
     logger.info("=" * 60)
 
-    logger.info("1. Проверка API...")
-    ohlcv = cc_get_ohlcv("BTC", "hour", 1)
+    logger.info("1. Проверка API (OHLCV BTC)...")
+    ohlcv = cc_get_ohlcv("BTC", "hour", 5)
     if ohlcv:
         last_time = datetime.fromtimestamp(ohlcv[-1]["time"])
         logger.info(f"   Успех! Последняя свеча: {last_time}")
+        logger.info(f"   Open=${ohlcv[-1]['open']:,.2f}, Close=${ohlcv[-1]['close']:,.2f}")
     else:
         logger.error("   Ошибка подключения")
         return
 
-    logger.info("2. Получение свечей BTC (1ч)...")
-    ohlcv = cc_get_ohlcv("BTC", "hour", 5)
-    if ohlcv:
-        logger.info(f"   Получено {len(ohlcv)} свечей")
-        logger.info(f"   Последняя: Open=${ohlcv[-1]['open']:,.2f}, Close=${ohlcv[-1]['close']:,.2f}")
-    else:
-        logger.error("   Ошибка")
-
-    logger.info("3. Получение текущей цены BTC...")
+    logger.info("2. Текущая цена BTC...")
     price = cc_get_price("BTC")
     if price:
         logger.info(f"   BTC: ${price:,.2f}")
     else:
         logger.error("   Ошибка")
 
-    logger.info("4. Получение статистики 24ч...")
+    logger.info("3. Статистика 24ч...")
     ticker = cc_get_ticker_24h("BTC")
     if ticker:
         logger.info(f"   Изменение 24ч: {ticker.get('CHANGEPCT24HOUR', 0):+.2f}%")
     else:
         logger.error("   Ошибка")
 
-    logger.info("5. Анализ сигнала BTC...")
+    logger.info("4. Анализ сигнала BTC...")
     signal = analyze_binance_signal("BTCUSDT", "1h")
     if signal:
         logger.info(f"   Сигнал: {signal['signal']} {signal['coin']} @ ${signal['entry']}")
