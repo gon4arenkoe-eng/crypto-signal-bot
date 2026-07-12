@@ -1,6 +1,5 @@
 """
-Crypto Signal Bot v7.2 — Работает на webhook без Application/Updater
-Использует telegram.Bot напрямую + Flask
+Crypto Signal Bot v7.3 — Исправлены async webhook + CoinGecko rate limit
 """
 
 import os
@@ -9,6 +8,7 @@ import time
 import logging
 import sqlite3
 import threading
+import asyncio
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import requests
@@ -37,7 +37,9 @@ SIGNAL_CONFIG = {
     "stop_loss_pct": 2.5,
     "min_risk_pct": 0.005,
     "atr_multiplier": 2.5,
-    "scan_interval": 600,
+    "scan_interval": 600,  # 10 минут
+    "scan_batch_size": 5,   # Сканировать 5 монет за раз
+    "scan_delay": 12,       # Задержка между монетами (сек) — для rate limit
 }
 
 SIGNAL_STARS = {
@@ -115,8 +117,13 @@ def cg_get(endpoint, params=None):
         r = requests.get(url, headers=HEADERS, params=params, timeout=15)
         if r.status_code == 200:
             return r.json()
-        logger.error(f"CoinGecko error {r.status_code}: {r.text}")
-        return None
+        elif r.status_code == 429:
+            logger.warning("CoinGecko rate limit hit, waiting...")
+            time.sleep(60)  # Ждём минуту при rate limit
+            return None
+        else:
+            logger.error(f"CoinGecko error {r.status_code}: {r.text}")
+            return None
     except Exception as e:
         logger.error(f"CoinGecko request failed: {e}")
         return None
@@ -363,8 +370,6 @@ def get_main_menu():
 
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 def handle_start(bot, chat_id, user):
-    """Обработка /start"""
-    # Сохраняем пользователя
     conn = get_db()
     c = conn.cursor()
     c.execute('''INSERT OR REPLACE INTO users 
@@ -377,7 +382,7 @@ def handle_start(bot, chat_id, user):
     welcome = f"""
 👋 <b>Привет, {user.first_name}!</b>
 
-🤖 <b>Crypto Signal Bot v7.2</b>
+🤖 <b>Crypto Signal Bot v7.3</b>
 Автоматические сигналы на основе технического анализа.
 
 📊 <b>Возможности:</b>
@@ -391,7 +396,6 @@ def handle_start(bot, chat_id, user):
     bot.send_message(chat_id=chat_id, text=welcome, parse_mode="HTML", reply_markup=get_main_menu())
 
 def handle_signal(bot, chat_id, args):
-    """Обработка /signal"""
     if not args:
         bot.send_message(chat_id=chat_id, text="❌ Укажи монету: /signal BTC\nИли выбери из /top", reply_markup=get_main_menu())
         return
@@ -431,7 +435,6 @@ def handle_signal(bot, chat_id, args):
         bot.send_message(chat_id=chat_id, text=f"⚠️ Нет сигнала для {coin.upper()}\nРынок нейтральный.", reply_markup=get_main_menu())
 
 def handle_scanner(bot, chat_id):
-    """Обработка /scanner"""
     bot.send_message(chat_id=chat_id, text="🔍 Сканирую рынок...", reply_markup=get_main_menu())
     
     top_coins = get_top_coins(50)
@@ -445,6 +448,7 @@ def handle_scanner(bot, chat_id):
             signal = analyze_coin(coin_id)
             if signal and signal["stars"] >= 2:
                 signals_found.append(signal)
+            time.sleep(2)  # Задержка между монетами
         except Exception as e:
             logger.error(f"Error analyzing {coin_id}: {e}")
             continue
@@ -466,7 +470,6 @@ def handle_scanner(bot, chat_id):
     bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML", reply_markup=get_main_menu())
 
 def handle_top(bot, chat_id):
-    """Обработка /top"""
     bot.send_message(chat_id=chat_id, text="📊 Загружаю топ...", reply_markup=get_main_menu())
     
     coins = get_top_coins(10)
@@ -482,7 +485,6 @@ def handle_top(bot, chat_id):
     bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML", reply_markup=get_main_menu())
 
 def handle_alert(bot, chat_id, user_id, args):
-    """Обработка /alert"""
     if len(args) < 3:
         bot.send_message(chat_id=chat_id, text="❌ Формат: /alert BTC above 70000\nили: /alert ETH below 2000", reply_markup=get_main_menu())
         return
@@ -511,7 +513,6 @@ def handle_alert(bot, chat_id, user_id, args):
     bot.send_message(chat_id=chat_id, text=f"🔔 <b>Алерт установлен!</b>\n\n{coin} {emoji} {condition} ${target:,.2f}", parse_mode="HTML", reply_markup=get_main_menu())
 
 def handle_alerts(bot, chat_id, user_id):
-    """Обработка /alerts"""
     conn = get_db()
     c = conn.cursor()
     c.execute('''SELECT coin, condition, target_price, triggered 
@@ -533,7 +534,6 @@ def handle_alerts(bot, chat_id, user_id):
     bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML", reply_markup=get_main_menu())
 
 def handle_stats(bot, chat_id):
-    """Обработка /stats"""
     conn = get_db()
     c = conn.cursor()
     
@@ -572,7 +572,6 @@ def handle_stats(bot, chat_id):
     bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML", reply_markup=get_main_menu())
 
 def handle_help(bot, chat_id):
-    """Обработка /help"""
     help_text = """
 📚 <b>ПОМОЩЬ</b>
 
@@ -601,7 +600,6 @@ def handle_help(bot, chat_id):
     bot.send_message(chat_id=chat_id, text=help_text, parse_mode="HTML", reply_markup=get_main_menu())
 
 def handle_text_message(bot, chat_id, text, user_id):
-    """Обработка текстовых кнопок меню"""
     if "Сигнал" in text:
         bot.send_message(chat_id=chat_id, text="Введи: /signal BTC\nили выбери из /top", reply_markup=get_main_menu())
     elif "Обзор" in text or "Сканер" in text:
@@ -618,7 +616,6 @@ def handle_text_message(bot, chat_id, text, user_id):
         handle_signal(bot, chat_id, [text.strip()])
 
 def process_update(bot, update_json):
-    """Обработка входящего обновления от Telegram"""
     try:
         update = Update.de_json(update_json, bot)
         
@@ -630,7 +627,6 @@ def process_update(bot, update_json):
         text = update.message.text or ""
         user_id = user.id
         
-        # Парсим команду
         if text.startswith("/start"):
             handle_start(bot, chat_id, user)
         elif text.startswith("/signal"):
@@ -753,7 +749,9 @@ def auto_scanner():
             check_alerts(bot)
             
             top_coins = get_top_coins(50)
-            for coin in top_coins[:30]:
+            scanned = 0
+            
+            for coin in top_coins[:SIGNAL_CONFIG["scan_batch_size"]]:
                 coin_id = coin.get("id")
                 if not coin_id:
                     continue
@@ -791,11 +789,16 @@ def auto_scanner():
                                     pass
                             
                             time.sleep(1)
+                    
+                    scanned += 1
+                    if scanned < SIGNAL_CONFIG["scan_batch_size"]:
+                        time.sleep(SIGNAL_CONFIG["scan_delay"])
+                        
                 except Exception as e:
                     logger.error(f"Scan error for {coin_id}: {e}")
                     continue
             
-            logger.info("Auto-scan completed")
+            logger.info(f"Auto-scan completed. Scanned: {scanned}")
         except Exception as e:
             logger.error(f"Auto-scanner error: {e}")
         
@@ -806,7 +809,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Crypto Signal Bot v7.2 is running!"
+    return "Crypto Signal Bot v7.3 is running!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -820,9 +823,39 @@ def webhook():
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "version": "7.2"})
+    return jsonify({"status": "ok", "version": "7.3"})
 
 # ==================== MAIN ====================
+def setup_webhook():
+    """Настройка webhook через requests вместо async Bot methods"""
+    try:
+        # Удаляем старый webhook
+        requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook", timeout=10)
+        time.sleep(1)
+        
+        # Устанавливаем новый
+        webhook_url = f"{WEBHOOK_URL}/webhook"
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TOKEN}/setWebhook",
+            params={"url": webhook_url},
+            timeout=10
+        )
+        
+        if resp.status_code == 200:
+            result = resp.json()
+            if result.get("ok"):
+                logger.info(f"✅ Webhook установлен: {webhook_url}")
+                return True
+            else:
+                logger.error(f"Webhook setup failed: {result}")
+        else:
+            logger.error(f"Webhook HTTP error: {resp.status_code}")
+            
+    except Exception as e:
+        logger.error(f"Webhook setup error: {e}")
+    
+    return False
+
 def main():
     global bot
     
@@ -835,26 +868,22 @@ def main():
     
     # Инициализация
     init_db()
+    logger.info("✅ База данных инициализирована")
     
-    # Создаём бота напрямую (без Application/Updater)
+    # Создаём бота
     bot = telegram.Bot(TOKEN)
     
-    # Устанавливаем webhook
-    webhook_url = f"{WEBHOOK_URL}/webhook"
-    try:
-        bot.delete_webhook()
-        time.sleep(1)
-        bot.set_webhook(url=webhook_url)
-        logger.info(f"✅ Webhook установлен: {webhook_url}")
-    except Exception as e:
-        logger.error(f"Webhook setup error: {e}")
+    # Настраиваем webhook через HTTP API (не async)
+    setup_webhook()
     
     # Запускаем фоновый сканер
     scanner_thread = threading.Thread(target=auto_scanner, daemon=True)
     scanner_thread.start()
+    logger.info("✅ Автосканер запущен")
     
     # Запускаем Flask
     port = int(os.environ.get("PORT", 10000))
+    logger.info(f"🚀 Запуск Flask на порту {port}")
     app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
