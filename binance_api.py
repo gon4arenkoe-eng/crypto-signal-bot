@@ -1,8 +1,7 @@
 """
-CryptoCompare API Integration Module v2
+CryptoCompare API Integration Module v3
 Публичные endpoints -- не требуют API ключ для базовых запросов
-Бесплатный план: 100k запросов/месяц, ~100 запросов/мин
-v2: добавлено кэширование, rate limiting, уменьшено количество запросов
+v3: убран /pricemultifull (rate limit), 24ч-изменение считаем из OHLCV
 """
 
 import os
@@ -18,14 +17,13 @@ CC_BASE = "https://min-api.cryptocompare.com/data"
 CC_API_KEY = os.environ.get("CRYPTOCOMPARE_API_KEY", "")
 
 # Rate limiting: минимальный интервал между запросами (сек)
-MIN_REQUEST_INTERVAL = 0.7  # ~85 запросов/мин с запасом
+MIN_REQUEST_INTERVAL = 1.0  # 60 запросов/мин -- запас для shared IP
 _last_request_time = 0
 
 # Кэш: {cache_key: (timestamp, data)}
 _cache = {}
-CACHE_TTL_SHORT = 30      # 30 сек для цен
-CACHE_TTL_MEDIUM = 300    # 5 мин для OHLCV
-CACHE_TTL_LONG = 600      # 10 мин для статистики
+CACHE_TTL_SHORT = 60      # 1 мин для цен
+CACHE_TTL_MEDIUM = 600    # 10 мин для OHLCV
 
 # Маппинг символов: coin_id -> CryptoCompare символ
 SYMBOL_MAP = {
@@ -113,8 +111,8 @@ def _cc_get(endpoint, params=None, use_cache=False, cache_ttl=60):
             if data.get("Response") == "Error":
                 msg = data.get('Message', 'Unknown error')
                 if "rate limit" in msg.lower():
-                    logger.warning(f"CryptoCompare rate limit hit: {msg}")
-                    time.sleep(3)
+                    logger.warning(f"CryptoCompare rate limit: {msg}")
+                    time.sleep(5)
                 else:
                     logger.error(f"CryptoCompare API error: {msg}")
                 return None
@@ -122,8 +120,8 @@ def _cc_get(endpoint, params=None, use_cache=False, cache_ttl=60):
                 _set_cache(cache_key, data)
             return data
         elif resp.status_code == 429:
-            logger.warning("CryptoCompare HTTP 429 rate limit, sleeping 5s...")
-            time.sleep(5)
+            logger.warning("CryptoCompare HTTP 429, sleeping 10s...")
+            time.sleep(10)
             return None
         else:
             logger.error(f"CryptoCompare HTTP {resp.status_code}: {resp.text[:200]}")
@@ -176,30 +174,6 @@ def cc_get_ohlcv(symbol="BTC", interval="hour", limit=100):
     return None
 
 
-def cc_get_ticker_24h(symbol="BTC"):
-    """Получить статистику 24ч (цена, изменение, объём)"""
-    fsym = _resolve_symbol(symbol)
-    params = {
-        "fsyms": fsym,
-        "tsyms": "USDT",
-    }
-    data = _cc_get("/pricemultifull", params, use_cache=True, cache_ttl=CACHE_TTL_LONG)
-    if data and "RAW" in data and fsym in data["RAW"]:
-        coin_data = data["RAW"][fsym]["USDT"]
-        return {
-            "PRICE": coin_data.get("PRICE", 0),
-            "CHANGEPCT24HOUR": coin_data.get("CHANGEPCT24HOUR", 0),
-            "CHANGE24HOUR": coin_data.get("CHANGE24HOUR", 0),
-            "HIGH24HOUR": coin_data.get("HIGH24HOUR", 0),
-            "LOW24HOUR": coin_data.get("LOW24HOUR", 0),
-            "VOLUME24HOUR": coin_data.get("VOLUME24HOURTO", 0),
-            "OPEN24HOUR": coin_data.get("OPEN24HOUR", 0),
-            "MKTCAP": coin_data.get("MKTCAP", 0),
-            "SUPPLY": coin_data.get("SUPPLY", 0),
-        }
-    return None
-
-
 def cc_get_price(symbol="BTC"):
     """Получить текущую цену"""
     fsym = _resolve_symbol(symbol)
@@ -214,7 +188,7 @@ def cc_get_price(symbol="BTC"):
 
 
 def cc_get_prices_multi(symbols):
-    """Получить цены нескольких монет за 1 запрос (экономия rate limit)"""
+    """Получить цены нескольких монет за 1 запрос"""
     if not symbols:
         return {}
     fsyms = ",".join([_resolve_symbol(s) for s in symbols])
@@ -234,7 +208,7 @@ def cc_get_top_coins(limit=50):
         "tsym": "USDT",
         "limit": limit,
     }
-    data = _cc_get("/top/mktcapfull", params, use_cache=True, cache_ttl=CACHE_TTL_LONG)
+    data = _cc_get("/top/mktcapfull", params, use_cache=True, cache_ttl=CACHE_TTL_MEDIUM)
     if data and "Data" in data:
         return data["Data"]
     return None
@@ -262,6 +236,17 @@ def calculate_ema(prices, period):
     return ema
 
 
+def _calculate_change_24h(ohlcv_data):
+    """Рассчитать изменение за 24ч из OHLCV данных (24 свечи по 1ч = 24ч)"""
+    if not ohlcv_data or len(ohlcv_data) < 25:
+        return 0
+    current = float(ohlcv_data[-1]["close"])
+    past = float(ohlcv_data[-25]["close"])  # 24 часа назад
+    if past == 0:
+        return 0
+    return ((current - past) / past) * 100
+
+
 def analyze_binance_signal(symbol="BTCUSDT", interval="1h"):
     """
     Анализ сигнала на основе CryptoCompare данных
@@ -269,7 +254,7 @@ def analyze_binance_signal(symbol="BTCUSDT", interval="1h"):
 
     Args:
         symbol: "BTCUSDT" или coin_id типа "bitcoin"
-        interval: "1h" (hour), "1d" (day), "1m" (minute) -- маппится на CryptoCompare
+        interval: "1h" (hour), "1d" (day), "1m" (minute)
 
     Returns:
         dict или None
@@ -280,6 +265,7 @@ def analyze_binance_signal(symbol="BTCUSDT", interval="1h"):
     elif interval in ["1m", "1M", "minute"]:
         cc_interval = "minute"
 
+    # Запрашиваем 100 свечей для EMA50 + запас для 24ч-изменения
     ohlcv = cc_get_ohlcv(symbol, cc_interval, limit=100)
     if not ohlcv or len(ohlcv) < 50:
         logger.warning(f"Недостаточно данных для {symbol}")
@@ -325,9 +311,8 @@ def analyze_binance_signal(symbol="BTCUSDT", interval="1h"):
     if not signal:
         return None
 
-    # Получаем изменение за 24ч (используем кэш)
-    ticker = cc_get_ticker_24h(symbol)
-    change_24h = float(ticker.get("CHANGEPCT24HOUR", 0)) if ticker else 0
+    # Изменение за 24ч считаем из OHLCV (не делаем лишний запрос)
+    change_24h = _calculate_change_24h(ohlcv)
 
     min_risk = current_close * 0.005
 
@@ -415,19 +400,30 @@ def binance_get_klines(symbol="BTCUSDT", interval="1h", limit=100):
 
 
 def binance_get_ticker_24h(symbol="BTCUSDT"):
-    """Алиас для cc_get_ticker_24h -- совместимость с bot.py"""
+    """Алиас для cc_get_ticker_24h -- совместимость с bot.py
+
+    Убран /pricemultifull из-за rate limit.
+    Возвращаем данные из OHLCV + текущей цены.
+    """
     fsym = _resolve_symbol(symbol)
-    ticker = cc_get_ticker_24h(fsym)
-    if ticker:
+
+    # Получаем OHLCV для 24ч-изменения
+    ohlcv = cc_get_ohlcv(symbol, "hour", 30)
+    change_24h = _calculate_change_24h(ohlcv) if ohlcv else 0
+
+    # Получаем текущую цену
+    price = cc_get_price(symbol)
+
+    if price:
         return {
-            "lastPrice": str(ticker.get("PRICE", 0)),
-            "priceChangePercent": str(ticker.get("CHANGEPCT24HOUR", 0)),
-            "priceChange": str(ticker.get("CHANGE24HOUR", 0)),
-            "highPrice": str(ticker.get("HIGH24HOUR", 0)),
-            "lowPrice": str(ticker.get("LOW24HOUR", 0)),
-            "volume": str(ticker.get("VOLUME24HOUR", 0)),
-            "openPrice": str(ticker.get("OPEN24HOUR", 0)),
-            "weightedAvgPrice": str(ticker.get("PRICE", 0)),
+            "lastPrice": str(price),
+            "priceChangePercent": str(change_24h),
+            "priceChange": str(price * change_24h / 100),
+            "highPrice": str(max([float(k["high"]) for k in ohlcv])) if ohlcv else str(price),
+            "lowPrice": str(min([float(k["low"]) for k in ohlcv])) if ohlcv else str(price),
+            "volume": str(sum([float(k.get("volumeto", 0)) for k in ohlcv])) if ohlcv else "0",
+            "openPrice": str(ohlcv[-25]["close"] if ohlcv and len(ohlcv) >= 25 else price),
+            "weightedAvgPrice": str(price),
         }
     return None
 
@@ -460,12 +456,9 @@ def test_binance_connection():
     else:
         logger.error("   Ошибка")
 
-    logger.info("3. Статистика 24ч...")
-    ticker = cc_get_ticker_24h("BTC")
-    if ticker:
-        logger.info(f"   Изменение 24ч: {ticker.get('CHANGEPCT24HOUR', 0):+.2f}%")
-    else:
-        logger.error("   Ошибка")
+    logger.info("3. 24ч изменение (из OHLCV)...")
+    change = _calculate_change_24h(ohlcv)
+    logger.info(f"   Изменение 24ч: {change:+.2f}%")
 
     logger.info("4. Анализ сигнала BTC...")
     signal = analyze_binance_signal("BTCUSDT", "1h")
