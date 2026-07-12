@@ -1,3 +1,8 @@
+from bybit_api import (
+    get_klines, get_tickers, get_wallet_balance,
+    get_positions, place_order, analyze_bybit_signal,
+    test_connection
+)
 """
 Crypto Signal Bot v8.1 — Исправленная версия (Render-ready)
 """
@@ -802,7 +807,9 @@ def main():
         raise ValueError("TELEGRAM_BOT_TOKEN is not set")
 
     init_db()
-
+    # ====== ТЕСТ BYBIT API ======
+    logger.info("🔌 Тестирую подключение к Bybit API...")
+    test_connection()
     # Удаляем webhook
     logger.info("🔄 Удаляем webhook...")
     try:
