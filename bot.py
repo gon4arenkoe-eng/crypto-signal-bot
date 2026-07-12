@@ -1,5 +1,6 @@
 """
-Crypto Signal Bot v9.0 — Bybit Integration + EMA Crossover Strategy
+Crypto Signal Bot v9.1 — Binance API Integration
+EMA8/EMA50 Crossover + RSI Strategy
 """
 
 import os
@@ -12,125 +13,23 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import requests
 
-# ==================== BYBIT API ====================
-import hmac
-import hashlib
-
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "")
-BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
-BYBIT_MODE = os.environ.get("BYBIT_MODE", "testnet")
-
-BASE_URLS = {
-    "testnet": "https://api-testnet.bybit.com",
-    "mainnet": "https://api.bybit.com",
-    "demo": "https://api-demo.bybit.com"
-}
-BYBIT_BASE = BASE_URLS.get(BYBIT_MODE, BASE_URLS["testnet"])
-
-logger = logging.getLogger(__name__)
-
-
-def generate_signature(timestamp, api_key, recv_window, params_str):
-    payload = timestamp + api_key + recv_window + params_str
-    return hmac.new(
-        BYBIT_API_SECRET.encode('utf-8'),
-        payload.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-
-
-def get_bybit_headers(method, endpoint, params=None, body=None):
-    timestamp = str(int(time.time() * 1000))
-    recv_window = "5000"
-    if method == "GET" and params:
-        params_str = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-    elif method == "POST" and body:
-        params_str = json.dumps(body)
-    else:
-        params_str = ""
-    signature = generate_signature(timestamp, BYBIT_API_KEY, recv_window, params_str)
-    return {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-SIGN": signature,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "Content-Type": "application/json"
-    }
-
-
-def bybit_get_klines(symbol="BTCUSDT", interval="60", category="linear", limit=200):
-    url = f"{BYBIT_BASE}/v5/market/kline"
-    params = {"category": category, "symbol": symbol, "interval": interval, "limit": limit}
-    try:
-        resp = requests.get(url, params=params, timeout=15)
-        data = resp.json()
-        if data.get("retCode") == 0:
-            return data["result"]["list"]
-        logger.error(f"Bybit klines error: {data}")
-        return []
-    except Exception as e:
-        logger.error(f"bybit_get_klines error: {e}")
-        return []
-
-
-def bybit_get_tickers(symbol="BTCUSDT", category="linear"):
-    url = f"{BYBIT_BASE}/v5/market/tickers"
-    params = {"category": category, "symbol": symbol}
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        data = resp.json()
-        if data.get("retCode") == 0:
-            return data["result"]["list"][0]
-        return None
-    except Exception as e:
-        logger.error(f"bybit_get_tickers error: {e}")
-        return None
-
-
-def bybit_get_wallet_balance(accountType="UNIFIED"):
-    if not BYBIT_API_KEY:
-        return None
-    url = f"{BYBIT_BASE}/v5/account/wallet-balance"
-    params = {"accountType": accountType}
-    headers = get_bybit_headers("GET", "/v5/account/wallet-balance", params=params)
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
-        data = resp.json()
-        if data.get("retCode") == 0:
-            return data["result"]["list"]
-        logger.error(f"Bybit balance error: {data}")
-        return None
-    except Exception as e:
-        logger.error(f"bybit_get_wallet_balance error: {e}")
-        return None
-
-
-def bybit_get_server_time():
-    url = f"{BYBIT_BASE}/v5/market/time"
-    try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data.get("retCode") == 0:
-            return int(data["result"]["timeSecond"])
-        return None
-    except Exception as e:
-        logger.error(f"bybit_get_server_time error: {e}")
-        return None
-
+# ==================== BINANCE API ====================
+from binance_api import (
+    binance_get_klines, binance_get_ticker_24h, binance_get_price,
+    analyze_binance_signal, test_binance_connection
+)
 
 # ==================== НАСТРОЙКИ ====================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 
 logger.info(f"🔍 TOKEN length: {len(TOKEN)}")
-logger.info(f"🔌 Bybit Mode: {BYBIT_MODE}")
-logger.info(f"🔌 Bybit URL: {BYBIT_BASE}")
-logger.info(f"🔌 Bybit Key: {BYBIT_API_KEY[:10]}..." if BYBIT_API_KEY else "❌ Bybit Key не задан")
 
 if TOKEN:
     try:
@@ -217,116 +116,23 @@ def init_db():
         sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, date_text TEXT DEFAULT (date('now')),
         UNIQUE(coin, signal_type, date_text)
     )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS paper_trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, coin TEXT, signal_type TEXT, entry REAL,
-        stop_loss REAL, take_profit REAL, exit_price REAL, pnl_pct REAL,
-        status TEXT, opened_at TIMESTAMP, closed_at TIMESTAMP
-    )''')
     conn.commit()
     conn.close()
 
 def get_db():
     return sqlite3.connect(DB_PATH)
 
-# ==================== ТЕХНИЧЕСКИЙ АНАЛИЗ (BYBIT) ====================
-def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return 50
-    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-    gains = [max(d, 0) for d in deltas]
-    losses = [abs(min(d, 0)) for d in deltas]
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100
-    return 100 - (100 / (1 + avg_gain / avg_loss))
-
-def calculate_ema(prices, period):
-    multiplier = 2 / (period + 1)
-    ema = [prices[0]]
-    for price in prices[1:]:
-        ema.append(price * multiplier + ema[-1] * (1 - multiplier))
-    return ema
-
+# ==================== ТЕХНИЧЕСКИЙ АНАЛИЗ ====================
 def analyze_coin(coin_id="bitcoin"):
-    """Новая стратегия: EMA8/EMA50 crossover + RSI на Bybit данных"""
+    """EMA8/EMA50 Crossover + RSI на Binance данных"""
     symbol_map = {
         "bitcoin": "BTCUSDT", "ethereum": "ETHUSDT", "solana": "SOLUSDT",
-        "binancecoin": "BNBUSDT", "ripple": "XRPUSDT", "dogecoin": "DOGEUSDT", "cardano": "ADAUSDT"
+        "binancecoin": "BNBUSDT", "ripple": "XRPUSDT", "dogecoin": "DOGEUSDT",
+        "cardano": "ADAUSDT", "polkadot": "DOTUSDT", "chainlink": "LINKUSDT",
+        "litecoin": "LTCUSDT"
     }
     symbol = symbol_map.get(coin_id, coin_id.upper() + "USDT")
-
-    klines = bybit_get_klines(symbol, interval="60", category="linear", limit=100)
-    if not klines or len(klines) < 50:
-        logger.warning(f"Недостаточно данных для {symbol}")
-        return None
-
-    klines_sorted = sorted(klines, key=lambda x: int(x[0]))
-    closes = [float(k[4]) for k in klines_sorted]
-    highs = [float(k[2]) for k in klines_sorted]
-    lows = [float(k[3]) for k in klines_sorted]
-
-    ema8 = calculate_ema(closes, 8)
-    ema50 = calculate_ema(closes, 50)
-    rsi = calculate_rsi(closes)
-
-    current_close = closes[-1]
-
-    ema_cross_up = (ema8[-2] <= ema50[-2] and ema8[-1] > ema50[-1])
-    ema_cross_down = (ema8[-2] >= ema50[-2] and ema8[-1] < ema50[-1])
-
-    recent_highs = highs[-14:]
-    recent_lows = lows[-14:]
-    atr = (max(recent_highs) - min(recent_lows)) / 14
-
-    support = min(lows[-20:])
-    resistance = max(highs[-20:])
-
-    signal = None
-    if ema_cross_up:
-        signal = "BUY"
-    elif ema_cross_down:
-        signal = "SELL"
-
-    if not signal:
-        return None
-
-    min_risk = current_close * 0.005
-
-    if signal == "BUY":
-        sl = min(current_close - atr * 2.5, current_close * 0.975, support * 0.998)
-        if current_close - sl < min_risk:
-            sl = current_close - min_risk
-        risk = current_close - sl
-        if risk <= 0:
-            return None
-        return {
-            "coin": symbol.replace("USDT", ""), "signal": signal,
-            "entry": round(current_close, 2), "stop_loss": round(sl, 2),
-            "take_profit_1": round(current_close + risk * 1.5, 2),
-            "take_profit_2": round(current_close + risk * 3.0, 2),
-            "take_profit_3": round(current_close + risk * 5.0, 2),
-            "risk_reward": 1.5, "stars": 4 if rsi < 40 else 3,
-            "rsi": round(rsi, 2), "change_24h": 0,
-            "price": current_close, "ema8": round(ema8[-1], 2), "ema50": round(ema50[-1], 2)
-        }
-    else:
-        sl = max(current_close + atr * 2.5, current_close * 1.025, resistance * 1.002)
-        if sl - current_close < min_risk:
-            sl = current_close + min_risk
-        risk = sl - current_close
-        if risk <= 0:
-            return None
-        return {
-            "coin": symbol.replace("USDT", ""), "signal": signal,
-            "entry": round(current_close, 2), "stop_loss": round(sl, 2),
-            "take_profit_1": round(current_close - risk * 1.5, 2),
-            "take_profit_2": round(current_close - risk * 3.0, 2),
-            "take_profit_3": round(current_close - risk * 5.0, 2),
-            "risk_reward": 1.5, "stars": 4 if rsi > 60 else 3,
-            "rsi": round(rsi, 2), "change_24h": 0,
-            "price": current_close, "ema8": round(ema8[-1], 2), "ema50": round(ema50[-1], 2)
-        }
+    return analyze_binance_signal(symbol, "1h")
 
 # ==================== ФОРМАТИРОВАНИЕ ====================
 def format_signal(s):
@@ -340,7 +146,7 @@ def format_signal(s):
 🎯 TP1: ${s['take_profit_1']:,.2f}
 📊 R:R 1:{s['risk_reward']}
 📈 {ema_info}
-RSI: {s['rsi']}"""
+RSI: {s['rsi']} | 24ч: {s['change_24h']}%"""
 
 def get_main_menu():
     return {
@@ -348,7 +154,7 @@ def get_main_menu():
             [{"text": "📈 Сигнал"}, {"text": "📊 Обзор"}],
             [{"text": "🔍 Сканер"}, {"text": "🔝 Топ"}],
             [{"text": "🔔 Алерты"}, {"text": "📈 Статистика"}],
-            [{"text": "💼 Баланс"}, {"text": "📚 Помощь"}]
+            [{"text": "📚 Помощь"}]
         ],
         "resize_keyboard": True
     }
@@ -362,7 +168,7 @@ def handle_start(chat_id, user):
               (user["id"], user.get("username"), user.get("first_name"), user.get("last_name"), chat_id))
     conn.commit()
     conn.close()
-    send_message(chat_id, f"👋 Привет, {user.get('first_name', 'друг')}!\n\n🤖 Crypto Signal Bot v9.0\nBybit Integration\n\nВыбери действие 👇")
+    send_message(chat_id, f"👋 Привет, {user.get('first_name', 'друг')}!\n\n🤖 Crypto Signal Bot v9.1\nBinance API + EMA Crossover\n\nВыбери действие 👇")
     send_message(chat_id, "Меню:", reply_markup=get_main_menu())
 
 def handle_signal(chat_id, args):
@@ -399,29 +205,11 @@ def handle_top(chat_id):
     coins = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
     msg = "🔝 <b>ТОП МОНЕТ</b>\n\n"
     for symbol in coins:
-        ticker = bybit_get_tickers(symbol, "linear")
+        ticker = binance_get_ticker_24h(symbol)
         if ticker:
             price = float(ticker.get("lastPrice", 0))
-            ch24 = float(ticker.get("price24hPcnt", 0)) * 100
+            ch24 = float(ticker.get("priceChangePercent", 0))
             msg += f"<b>{symbol.replace('USDT', '')}</b> ${price:,.2f} {'🟢' if ch24>=0 else '🔴'} {ch24:+.2f}%\n"
-    send_message(chat_id, msg)
-
-def handle_balance(chat_id):
-    if not BYBIT_API_KEY:
-        send_message(chat_id, "❌ Bybit API не настроен. Добавь BYBIT_API_KEY в переменные окружения.")
-        return
-    balance = bybit_get_wallet_balance("UNIFIED")
-    if not balance:
-        send_message(chat_id, "❌ Не удалось получить баланс. Проверь API ключи.")
-        return
-    msg = "💼 <b>БАЛАНС BYBIT</b>\n\n"
-    for acc in balance:
-        msg += f"Account: <b>{acc.get('accountType', 'N/A')}</b>\n"
-        for coin in acc.get('coin', []):
-            name = coin.get('coin', '')
-            bal = float(coin.get('walletBalance', 0))
-            if bal > 0:
-                msg += f"  {name}: {bal:,.4f}\n"
     send_message(chat_id, msg)
 
 def handle_alert(chat_id, user_id, args):
@@ -500,15 +288,15 @@ def handle_help(chat_id):
 /signal BTC — сигнал на монету
 /scanner — сканер рынка
 /top — топ монет
-/balance — баланс Bybit
 /alert BTC above 70000 — алерт
 /alerts — мои алерты
 /stats — статистика
 
-<b>Стратегия v9.0:</b>
+<b>Стратегия v9.1:</b>
 📈 EMA8/EMA50 Crossover + RSI
-📊 Данные с Bybit API
+📊 Данные с Binance API
 🎯 Таймфрейм: 1 час
+📈 Объём подтверждение
 """)
 
 def process_update(update):
@@ -535,8 +323,6 @@ def process_update(update):
             handle_scanner(chat_id); handled = True
         elif text.startswith("/top"):
             handle_top(chat_id); handled = True
-        elif text.startswith("/balance"):
-            handle_balance(chat_id); handled = True
         elif text.startswith("/alert"):
             handle_alert(chat_id, user_id, text.split()[1:]); handled = True
         elif text.startswith("/alerts"):
@@ -555,8 +341,6 @@ def process_update(update):
             handle_alerts(chat_id, user_id); handled = True
         elif "Статистика" in text:
             handle_stats(chat_id); handled = True
-        elif "Баланс" in text:
-            handle_balance(chat_id); handled = True
         elif "Помощь" in text:
             handle_help(chat_id); handled = True
 
@@ -576,10 +360,9 @@ def check_alerts():
     alerts = c.fetchall()
     for alert_id, user_id, coin, condition, target in alerts:
         try:
-            ticker = bybit_get_tickers(coin + "USDT", "linear")
-            if not ticker:
+            price = binance_get_price(coin + "USDT")
+            if price is None:
                 continue
-            price = float(ticker.get("lastPrice", 0))
             triggered = False
             if condition == "above" and price >= target:
                 triggered = True
@@ -668,58 +451,16 @@ def auto_scanner():
             logger.error(f"Sleep error: {e}")
             time.sleep(60)
 
-# ==================== BYBIT TEST ====================
-def test_bybit_connection():
-    logger.info("=" * 60)
-    logger.info("🔌 ТЕСТ ПОДКЛЮЧЕНИЯ К BYBIT API")
-    logger.info("=" * 60)
-    logger.info(f"Режим: {BYBIT_MODE}")
-    logger.info(f"URL: {BYBIT_BASE}")
-    logger.info(f"API Key: {BYBIT_API_KEY[:15]}..." if BYBIT_API_KEY else "❌ Не задан")
-
-    server_time = bybit_get_server_time()
-    if server_time:
-        logger.info(f"✅ Серверное время: {datetime.fromtimestamp(server_time)}")
-    else:
-        logger.error("❌ Не удалось получить серверное время")
-
-    klines = bybit_get_klines("BTCUSDT", "60", "linear", 5)
-    if klines:
-        logger.info(f"✅ Свечи BTC: {len(klines)} получено")
-    else:
-        logger.error("❌ Не удалось получить свечи")
-
-    ticker = bybit_get_tickers("BTCUSDT", "linear")
-    if ticker:
-        logger.info(f"✅ BTC цена: ${ticker.get('lastPrice', 'N/A')}")
-    else:
-        logger.error("❌ Не удалось получить цену")
-
-    if BYBIT_API_KEY:
-        balance = bybit_get_wallet_balance()
-        if balance:
-            logger.info("✅ Баланс получен")
-        else:
-            logger.error("❌ Не удалось получить баланс")
-
-    signal = analyze_coin("bitcoin")
-    if signal:
-        logger.info(f"✅ Сигнал: {signal['signal']} {signal['coin']} @ ${signal['entry']}")
-    else:
-        logger.info("⚠️ Нет сигнала")
-
-    logger.info("=" * 60)
-
 # ==================== FLASK ====================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot v9.0 Bybit Integration running!"
+    return "Bot v9.1 Binance Integration running!"
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "version": "9.0", "bybit_mode": BYBIT_MODE})
+    return jsonify({"status": "ok", "version": "9.1", "api": "binance"})
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -732,8 +473,8 @@ def main():
 
     init_db()
 
-    # Тест Bybit API
-    test_bybit_connection()
+    # Тест Binance API
+    test_binance_connection()
 
     # Удаляем webhook
     logger.info("🔄 Удаляем webhook...")
