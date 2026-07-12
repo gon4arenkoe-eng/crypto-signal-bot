@@ -1,951 +1,960 @@
-#!/usr/bin/env python3
 """
-Crypto Signal Bot v6.4 — CoinGecko API (минимальная стабильная версия)
-Фикс: ленивая загрузка, маленький watchlist, задержки между запросами
+Crypto Signal Bot v7.0 - CoinGecko Edition
+Автосигналы, алерты, статистика, webhook
 """
 
 import os
-import logging
-import threading
+import json
 import time
-from datetime import datetime
-from typing import Optional, List, Dict, Tuple
-
-import requests
+import logging
+import sqlite3
+import threading
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
+import requests
+import telegram
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
 
-# ============ КОНФИГУРАЦИЯ ============
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-CG_API_KEY = os.environ.get("CG_API_KEY", "")
-CG_BASE_URL = "https://api.coingecko.com/api/v3"
-USE_POLLING = os.environ.get("USE_POLLING", "true").lower() == "true"
-
-# Минимальный watchlist для стабильной работы без API key
-COIN_MAP = {
-    "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "ripple",
-    "DOGE": "dogecoin", "ADA": "cardano", "DOT": "polkadot", "LINK": "chainlink",
-    "AVAX": "avalanche-2", "MATIC": "matic-network", "BNB": "binancecoin",
-    "UNI": "uniswap", "LTC": "litecoin", "ATOM": "cosmos", "NEAR": "near",
-    "APT": "aptos", "ARB": "arbitrum", "OP": "optimism", "SUI": "sui",
-    "SEI": "sei-network", "TIA": "celestia", "INJ": "injective-protocol",
-    "RENDER": "render-token", "FET": "fetch-ai", "PEPE": "pepe",
-    "SHIB": "shiba-inu", "WLD": "worldcoin-wld", "STRK": "starknet",
-    "IMX": "immutable-x", "GRT": "the-graph", "AAVE": "aave", "MKR": "maker",
-    "LDO": "lido-dao", "CRV": "curve-dao-token", "SNX": "havven",
-    "COMP": "compound-governance-token", "YFI": "yearn-finance",
-    "1INCH": "1inch", "DYDX": "dydx", "SUSHI": "sushi",
-    "BAL": "balancer", "FXS": "frax-share", "CVX": "convex-finance",
-    "GMX": "gmx", "RDNT": "radiant-capital", "MAGIC": "magic",
-    "WIF": "dogwifcoin", "BONK": "bonk", "FLOKI": "floki",
-    "MEME": "memecoin", "TURBO": "turbo", "PEOPLE": "constitutiondao",
-    "TRB": "tellor", "PENDLE": "pendle", "EIGEN": "eigenlayer",
-    "ETHFI": "ether-fi", "REZ": "renzo", "SAGA": "saga-2",
-    "OMNI": "omni-network", "DYM": "dymension", "MANTA": "manta-network",
-    "ALT": "altlayer", "PIXEL": "pixels", "PORTAL": "portal",
-    "AEVO": "aevo", "W": "wormhole", "ZK": "zksync", "MNT": "mantle",
-    "KAS": "kaspa", "TAO": "bittensor", "RNDR": "render-token",
-    "AGIX": "singularitynet", "OCEAN": "ocean-protocol", "FIL": "filecoin",
-    "AR": "arweave", "XMR": "monero", "BCH": "bitcoin-cash",
-    "XLM": "stellar", "ALGO": "algorand", "XTZ": "tezos", "TRX": "tron",
-    "VET": "vechain", "ICP": "internet-computer", "THETA": "theta-token",
-    "CHZ": "chiliz", "SAND": "the-sandbox", "MANA": "decentraland",
-    "AXS": "axie-infinity", "GALA": "gala", "GMT": "stepn",
-    "PRIME": "echelon-prime", "RON": "ronin", "SUPER": "superfarm",
-    "ZETA": "zetachain", "DEGEN": "degen-base", "AERO": "aerodrome-finance",
-    "VELO": "velodrome-finance", "CAKE": "pancakeswap-token", "JOE": "joe",
-    "BANANA": "banana-gun", "MAV": "maverick-protocol", "BOME": "book-of-meme",
-    "SLERF": "slerf", "MEW": "cat-in-a-dogs-world", "POPCAT": "popcat",
-    "MOG": "mog-coin", "BRETT": "brett", "ANDY": "andy",
-    "APU": "apu-apustaja", "BOBO": "bobo",
-}
-
-# Маленький watchlist для стабильной работы без API key
-WATCHLIST = [
-    "BTC", "ETH", "SOL", "XRP", "DOGE",
-    "ADA", "DOT", "LINK", "AVAX", "MATIC",
-]
-
-SIGNAL_CONFIG = {
-    "rsi_overbought": 70, "rsi_oversold": 30, "volume_spike": 2.0,
-    "price_change_24h": 5.0, "stop_loss_pct": 3.0, "take_profit_1": 5.0,
-    "take_profit_2": 10.0, "take_profit_3": 20.0, "risk_reward_min": 2.0,
-}
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# ==================== НАСТРОЙКИ ====================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-session = requests.Session()
+# Environment variables
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
+COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
+USE_POLLING = os.environ.get("USE_POLLING", "false").lower() == "true"
 
-# ============ COINGECKO API (с задержками) ============
+# CoinGecko
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+HEADERS = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
 
-class CoinGeckoAPI:
-    def __init__(self, api_key: str = ""):
-        self.api_key = api_key
-        self.base_url = CG_BASE_URL
-        self.session = requests.Session()
-        if api_key:
-            self.session.headers.update({"x-cg-demo-api-key": api_key})
-            logger.info("✅ CoinGecko API Key активирован (100 req/min)")
+# Настройки сигналов
+SIGNAL_CONFIG = {
+    "stop_loss_pct": 2.5,
+    "min_risk_pct": 0.005,  # Минимальный риск 0.5%
+    "atr_multiplier": 2.5,
+    "rsi_overbought": 70,
+    "rsi_oversold": 30,
+    "scan_interval": 600,  # 10 минут
+}
+
+# Категории сигналов
+SIGNAL_STARS = {
+    5: "⭐⭐⭐⭐⭐ МОЩНЫЙ",
+    4: "⭐⭐⭐⭐ Сильный",
+    3: "⭐⭐⭐ Хороший",
+    2: "⭐⭐ Слабый",
+    1: "⭐ Очень слабый"
+}
+
+# ==================== БАЗА ДАННЫХ ====================
+DB_PATH = "bot_data.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Пользователи
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        chat_id INTEGER,
+        auto_signals INTEGER DEFAULT 1,
+        min_stars INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # История сигналов
+    c.execute('''CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        coin TEXT,
+        signal_type TEXT,
+        entry REAL,
+        stop_loss REAL,
+        take_profit_1 REAL,
+        take_profit_2 REAL,
+        take_profit_3 REAL,
+        risk_reward REAL,
+        stars INTEGER,
+        rsi REAL,
+        change_24h REAL,
+        sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(coin, signal_type, entry, sent_at)
+    )''')
+    
+    # Алерты
+    c.execute('''CREATE TABLE IF NOT EXISTS alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        coin TEXT,
+        condition TEXT,  -- above/below
+        target_price REAL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        triggered INTEGER DEFAULT 0
+    )''')
+    
+    # Отправленные сигналы (для отслеживания повторов)
+    c.execute('''CREATE TABLE IF NOT EXISTS sent_signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        coin TEXT,
+        signal_type TEXT,
+        stars INTEGER,
+        sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(coin, signal_type, DATE(sent_at))
+    )''')
+    
+    conn.commit()
+    conn.close()
+
+def get_db():
+    return sqlite3.connect(DB_PATH)
+
+# ==================== COINGECKO API ====================
+def cg_get(endpoint, params=None):
+    url = f"{COINGECKO_BASE}{endpoint}"
+    try:
+        r = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+        logger.error(f"CoinGecko error {r.status_code}: {r.text}")
+        return None
+    except Exception as e:
+        logger.error(f"CoinGecko request failed: {e}")
+        return None
+
+def get_coin_data(coin_id="bitcoin"):
+    """Получить данные монеты"""
+    data = cg_get(f"/coins/{coin_id}", {
+        "localization": "false",
+        "tickers": "false",
+        "market_data": "true",
+        "community_data": "false",
+        "developer_data": "false",
+        "sparkline": "false"
+    })
+    return data
+
+def get_market_chart(coin_id="bitcoin", days=30):
+    """Получить исторические данные для расчёта индикаторов"""
+    data = cg_get(f"/coins/{coin_id}/market_chart", {
+        "vs_currency": "usd",
+        "days": str(days)
+    })
+    return data
+
+def get_top_coins(limit=100):
+    """Топ монет по капитализации"""
+    data = cg_get("/coins/markets", {
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": limit,
+        "page": 1,
+        "sparkline": "false",
+        "price_change_percentage": "24h"
+    })
+    return data or []
+
+# ==================== ТЕХНИЧЕСКИЙ АНАЛИЗ ====================
+def calculate_rsi(prices, period=14):
+    """Расчёт RSI"""
+    if len(prices) < period + 1:
+        return 50
+    
+    gains = []
+    losses = []
+    
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i-1]
+        if change > 0:
+            gains.append(change)
+            losses.append(0)
         else:
-            logger.info("⚠️ CoinGecko без API Key (10-30 req/min)")
-
-    def _get(self, endpoint: str, params: dict = None) -> Optional[dict]:
-        # Задержка перед каждым запросом (без ключа: 2s, с ключом: 0.1s)
-        delay = 2.0 if not self.api_key else 0.1
-        time.sleep(delay)
-
-        try:
-            url = f"{self.base_url}/{endpoint}"
-            resp = self.session.get(url, params=params, timeout=20)
-            if resp.status_code == 200:
-                return resp.json()
-            elif resp.status_code == 429:
-                retry_after = int(resp.headers.get('Retry-After', 60))
-                logger.warning(f"⏳ Rate limit 429! Retry-After: {retry_after}s")
-                time.sleep(retry_after)
-                return self._get(endpoint, params)
-            else:
-                logger.error(f"❌ CoinGecko HTTP {resp.status_code}: {resp.text[:200]}")
-                return None
-        except Exception as e:
-            logger.error(f"💥 CoinGecko error: {e}")
-            return None
-
-    def get_simple_price(self, ids: List[str], vs_currencies: str = "usd",
-                         include_24hr_change: bool = True) -> Optional[dict]:
-        ids_str = ",".join(ids[:250])
-        params = {
-            "ids": ids_str, "vs_currencies": vs_currencies,
-            "include_24hr_change": str(include_24hr_change).lower(),
-            "include_24hr_vol": "true", "include_market_cap": "true",
-            "include_last_updated_at": "true",
-        }
-        return self._get("simple/price", params)
-
-    def get_markets(self, vs_currency: str = "usd", per_page: int = 250, page: int = 1) -> Optional[List[dict]]:
-        params = {
-            "vs_currency": vs_currency, "order": "market_cap_desc",
-            "per_page": per_page, "page": page, "sparkline": "false",
-            "price_change_percentage": "24h",
-        }
-        return self._get("coins/markets", params)
-
-    def get_market_chart(self, coin_id: str, vs_currency: str = "usd", days: int = 30) -> Optional[dict]:
-        params = {"vs_currency": vs_currency, "days": days, "interval": "daily" if days > 90 else "hourly"}
-        return self._get(f"coins/{coin_id}/market_chart", params)
-
-    def get_ohlc(self, coin_id: str, vs_currency: str = "usd", days: int = 30) -> Optional[List]:
-        return self._get(f"coins/{coin_id}/ohlc", {"vs_currency": vs_currency, "days": days})
-
-
-cg = CoinGeckoAPI(api_key=CG_API_KEY)
-
-# ============ CACHE ============
-
-class Cache:
-    def __init__(self, ttl: int = 60):
-        self._cache = {}
-        self.ttl = ttl
-        self.lock = threading.Lock()
-
-    def get(self, key: str):
-        with self.lock:
-            if key in self._cache:
-                data, timestamp = self._cache[key]
-                if time.time() - timestamp < self.ttl:
-                    return data
-                del self._cache[key]
-            return None
-
-    def set(self, key: str, data):
-        with self.lock:
-            self._cache[key] = (data, time.time())
-
-
-cache = Cache(ttl=60)
-
-# ============ TELEGRAM API ============
-
-def tg_post(method: str, json_data: dict = None, retries: int = 3) -> Optional[dict]:
-    for attempt in range(retries):
-        try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-            resp = session.post(url, json=json_data, timeout=(10, 30))
-
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("ok"):
-                    return data
-                else:
-                    logger.error(f"Telegram API error: {data}")
-                    return data
-            elif resp.status_code == 429:
-                retry_after = int(resp.headers.get('Retry-After', 5))
-                logger.warning(f"Telegram rate limit, retry after {retry_after}s")
-                time.sleep(retry_after)
-            elif resp.status_code == 409:
-                logger.error(f"Telegram Conflict (409): Another instance is polling")
-                return None
-            else:
-                logger.error(f"Telegram HTTP {resp.status_code}: {resp.text[:200]}")
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt)
-        except Exception as e:
-            logger.error(f"Telegram error (attempt {attempt+1}): {e}")
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
-    return None
-
-
-def send_message(chat_id: int, text: str, parse_mode: str = "HTML", reply_markup=None) -> Optional[dict]:
-    data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
-    if reply_markup:
-        data["reply_markup"] = reply_markup
-    return tg_post("sendMessage", data)
-
-
-def edit_message(chat_id: int, message_id: int, text: str, parse_mode: str = "HTML", reply_markup=None) -> Optional[dict]:
-    data = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": parse_mode}
-    if reply_markup:
-        data["reply_markup"] = reply_markup
-    return tg_post("editMessageText", data)
-
-
-def set_webhook(url: str) -> Optional[dict]:
-    return tg_post("setWebhook", {"url": url, "drop_pending_updates": True})
-
-
-def delete_webhook() -> Optional[dict]:
-    return tg_post("deleteWebhook", {"drop_pending_updates": True})
-
-
-def get_webhook_info() -> Optional[dict]:
-    return tg_post("getWebhookInfo")
-
-
-def get_updates(offset: int = 0, limit: int = 100, timeout: int = 30) -> Optional[dict]:
-    return tg_post("getUpdates", {"offset": offset, "limit": limit, "timeout": timeout})
-
-
-# ============ POLLING MODE ============
-
-def polling_loop():
-    logger.info("🔄 Запущен polling mode")
-    offset = 0
-    consecutive_errors = 0
-
-    while True:
-        try:
-            result = get_updates(offset=offset, limit=100, timeout=30)
-            if result and result.get("ok"):
-                consecutive_errors = 0
-                updates = result.get("result", [])
-                for update in updates:
-                    offset = max(offset, update["update_id"] + 1)
-                    try:
-                        if "message" in update:
-                            handle_message(update["message"])
-                        elif "callback_query" in update:
-                            handle_callback(update["callback_query"])
-                    except Exception as e:
-                        logger.error(f"Error handling update: {e}")
-            else:
-                consecutive_errors += 1
-                logger.warning(f"Polling error #{consecutive_errors}: {result}")
-                if consecutive_errors > 10:
-                    logger.error("Too many polling errors, waiting 60s...")
-                    time.sleep(60)
-                    consecutive_errors = 0
-                else:
-                    time.sleep(5)
-        except Exception as e:
-            logger.error(f"Polling loop error: {e}")
-            time.sleep(10)
-
-
-# ============ ТЕХНИЧЕСКИЙ АНАЛИЗ ============
-
-def calc_rsi(closes: List[float], period: int = 14) -> float:
-    if len(closes) < period + 1:
-        return 50.0
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i-1]
-        gains.append(max(change, 0))
-        losses.append(abs(min(change, 0)))
+            gains.append(0)
+            losses.append(abs(change))
+    
+    if len(gains) < period:
+        return 50
+    
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
+    
     if avg_loss == 0:
-        return 100.0
-    return round(100 - (100 / (1 + avg_gain / avg_loss)), 2)
+        return 100
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return round(rsi, 2)
 
+def calculate_atr(highs, lows, closes, period=14):
+    """Расчёт ATR"""
+    if len(closes) < period + 1:
+        return closes[-1] * 0.02 if closes else 0.01
+    
+    tr_list = []
+    for i in range(1, len(closes)):
+        tr1 = highs[i] - lows[i]
+        tr2 = abs(highs[i] - closes[i-1])
+        tr3 = abs(lows[i] - closes[i-1])
+        tr_list.append(max(tr1, tr2, tr3))
+    
+    if len(tr_list) < period:
+        return sum(tr_list) / len(tr_list) if tr_list else 0.01
+    
+    atr = sum(tr_list[-period:]) / period
+    return atr
 
-def calc_ema(prices: List[float], period: int) -> List[float]:
+def calculate_bollinger(prices, period=20, std_dev=2):
+    """Расчёт полос Боллинджера"""
     if len(prices) < period:
-        return prices
-    mult = 2 / (period + 1)
-    ema = [sum(prices[:period]) / period]
-    for p in prices[period:]:
-        ema.append((p - ema[-1]) * mult + ema[-1])
-    return ema
-
-
-def calc_macd(closes: List[float]) -> tuple:
-    ema12 = calc_ema(closes, 12)
-    ema26 = calc_ema(closes, 26)
-    min_len = min(len(ema12), len(ema26))
-    macd_line = [e12 - e26 for e12, e26 in zip(ema12[-min_len:], ema26[-min_len:])]
-    signal_line = calc_ema(macd_line, 9)
-    min_len2 = min(len(macd_line), len(signal_line))
-    hist = [macd_line[-min_len2 + i] - signal_line[i] for i in range(min_len2)]
-    return macd_line[-1], signal_line[-1] if signal_line else 0, hist[-1] if hist else 0
-
-
-def calc_atr(ohlcv: List[List], period: int = 14) -> float:
-    if len(ohlcv) < period + 1:
-        return 0.0
-    trs = []
-    for i in range(1, len(ohlcv)):
-        high = float(ohlcv[i][2])
-        low = float(ohlcv[i][3])
-        prev_close = float(ohlcv[i-1][4])
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-    return round(sum(trs[-period:]) / period, 4)
-
-
-def calc_bollinger(closes: List[float], period: int = 20, std_dev: int = 2):
-    if len(closes) < period:
-        return None, None, None
-    recent = closes[-period:]
-    sma = sum(recent) / period
-    variance = sum((x - sma) ** 2 for x in recent) / period
-    std = variance ** 0.5
-    upper = sma + std_dev * std
-    lower = sma - std_dev * std
-    return round(upper, 2), round(sma, 2), round(lower, 2)
-
-
-def calc_support_resistance(ohlcv: List[List], lookback: int = 20):
-    recent = ohlcv[-lookback:]
-    highs = [float(k[2]) for k in recent]
-    lows = [float(k[3]) for k in recent]
-    return round(max(highs), 2), round(min(lows), 2)
-
-
-def calc_volume_spike(volumes: List[float]) -> float:
-    if len(volumes) < 20:
-        return 1.0
-    avg = sum(volumes[:-1]) / len(volumes[:-1])
-    return round(volumes[-1] / avg, 2) if avg > 0 else 1.0
-
-
-# ============ РАСЧЁТ УРОВНЕЙ ============
-
-def calculate_levels(signal: str, entry: float, atr: float, support: float, resistance: float, bb_upper, bb_lower):
-    cfg = SIGNAL_CONFIG
-    if signal == "BUY":
-        sl_atr = entry - (atr * 2.5)
-        sl_pct = entry * (1 - cfg["stop_loss_pct"] / 100)
-        stop_loss = round(min(sl_atr, sl_pct, support * 0.998), 2)
-        risk = entry - stop_loss
-        tp1 = round(entry + risk * 1.5, 2)
-        tp2 = round(entry + risk * 3.0, 2)
-        tp3 = round(entry + risk * 5.0, 2)
-        tp1 = min(tp1, resistance * 0.995)
-        tp2 = min(tp2, bb_upper if bb_upper else float('inf'))
-    elif signal == "SELL":
-        sl_atr = entry + (atr * 2.5)
-        sl_pct = entry * (1 + cfg["stop_loss_pct"] / 100)
-        stop_loss = round(max(sl_atr, sl_pct, resistance * 1.002), 2)
-        risk = stop_loss - entry
-        tp1 = round(entry - risk * 1.5, 2)
-        tp2 = round(entry - risk * 3.0, 2)
-        tp3 = round(entry - risk * 5.0, 2)
-        tp1 = max(tp1, support * 1.005)
-        tp2 = max(tp2, bb_lower if bb_lower else 0)
-    else:
-        return {}
-    rr = round((tp1 - entry) / (entry - stop_loss), 2) if signal == "BUY" else round((entry - tp1) / (stop_loss - entry), 2)
-    return {
-        "entry": round(entry, 2), "stop_loss": stop_loss,
-        "take_profit_1": tp1, "take_profit_2": tp2, "take_profit_3": tp3,
-        "risk_reward_1": rr, "risk_amount": round(abs(entry - stop_loss), 2)
-    }
-
-
-# ============ ОСНОВНОЙ АНАЛИЗ ============
-
-def get_ohlcv_for_coin(coin_id: str, days: int = 30) -> Optional[List[List]]:
-    ohlc = cg.get_ohlc(coin_id, days=days)
-    if ohlc and len(ohlc) > 0:
-        return ohlc
-    return None
-
-
-def get_prices_and_volumes(coin_id: str, days: int = 30) -> Tuple[Optional[List], Optional[List]]:
-    cache_key = f"chart_{coin_id}_{days}"
-    cached = cache.get(cache_key)
-    if cached:
-        return cached
-    chart = cg.get_market_chart(coin_id, days=days)
-    if not chart:
         return None, None
-    prices = [p[1] for p in chart.get("prices", [])]
-    volumes = [v[1] for v in chart.get("total_volumes", [])]
-    result = (prices, volumes)
-    cache.set(cache_key, result)
-    return result
+    
+    recent = prices[-period:]
+    sma = sum(recent) / period
+    variance = sum((p - sma) ** 2 for p in recent) / period
+    std = variance ** 0.5
+    
+    upper = sma + (std * std_dev)
+    lower = sma - (std * std_dev)
+    
+    return upper, lower
 
-
-def analyze_symbol(symbol: str) -> Optional[dict]:
-    coin_id = COIN_MAP.get(symbol.upper())
-    if not coin_id:
-        return None
-
-    cache_key = f"price_{coin_id}"
-    price_data = cache.get(cache_key)
-    if not price_data:
-        price_data = cg.get_simple_price([coin_id], include_24hr_change=True)
-        if price_data:
-            cache.set(cache_key, price_data)
-
-    if not price_data or coin_id not in price_data:
-        return None
-
-    coin_info = price_data[coin_id]
-    price = float(coin_info.get("usd", 0))
-    price_change = float(coin_info.get("usd_24h_change", 0) or 0)
-    volume_24h = float(coin_info.get("usd_24h_vol", 0) or 0)
-    market_cap = float(coin_info.get("usd_market_cap", 0) or 0)
-
-    if price == 0:
-        return None
-
-    prices, volumes = get_prices_and_volumes(coin_id, days=30)
-    if not prices or len(prices) < 50:
-        prices, volumes = get_prices_and_volumes(coin_id, days=7)
-        if not prices or len(prices) < 50:
+def calculate_levels(signal_type, entry, atr, support, resistance):
+    """Расчёт уровней входа/стоп/тейков с минимальным риском"""
+    cfg = SIGNAL_CONFIG
+    min_risk = entry * cfg["min_risk_pct"]
+    
+    if signal_type == "BUY":
+        # Стоп-лосс: максимум из ATR, процента, поддержки
+        sl_atr = entry - (atr * cfg["atr_multiplier"])
+        sl_pct = entry * (1 - cfg["stop_loss_pct"] / 100)
+        sl_support = support * 0.998
+        
+        stop_loss = min(sl_atr, sl_pct, sl_support)
+        
+        # Минимальный отступ 0.5%
+        if entry - stop_loss < min_risk:
+            stop_loss = entry - min_risk
+            
+        stop_loss = round(stop_loss, 8)
+        risk = entry - stop_loss
+        
+        # Если риск нулевой — отмена сигнала
+        if risk <= 0:
             return None
-
-    ohlcv = get_ohlcv_for_coin(coin_id, days=30)
-    if not ohlcv or len(ohlcv) < 20:
-        ohlcv = get_ohlcv_for_coin(coin_id, days=7)
-
-    closes = prices
-    closes_1h = closes
-    closes_4h = closes[::4] if len(closes) >= 4 * 14 else closes
-
-    rsi_1h = calc_rsi(closes_1h)
-    rsi_4h = calc_rsi(closes_4h) if len(closes_4h) > 14 else rsi_1h
-    macd_val, signal_val, histogram = calc_macd(closes_1h)
-
-    if ohlcv and len(ohlcv) > 20:
-        atr = calc_atr(ohlcv)
-        bb_upper, bb_mid, bb_lower = calc_bollinger([float(k[4]) for k in ohlcv])
-        resistance, support = calc_support_resistance(ohlcv)
-        high_24h = max([float(k[2]) for k in ohlcv[-24:]]) if len(ohlcv) >= 24 else max([float(k[2]) for k in ohlcv])
-        low_24h = min([float(k[3]) for k in ohlcv[-24:]]) if len(ohlcv) >= 24 else min([float(k[3]) for k in ohlcv])
-    else:
-        atr = abs(price * 0.02)
-        bb_upper, bb_mid, bb_lower = calc_bollinger(closes_1h)
-        recent = closes_1h[-20:]
-        resistance = round(max(recent), 2)
-        support = round(min(recent), 2)
-        high_24h = max(closes_1h[-24:]) if len(closes_1h) >= 24 else max(closes_1h)
-        low_24h = min(closes_1h[-24:]) if len(closes_1h) >= 24 else min(closes_1h)
-
-    volume_spike = calc_volume_spike(volumes) if volumes else 1.0
-
-    signal = None
-    strength = 0
-    reasons = []
-
-    if rsi_1h <= SIGNAL_CONFIG["rsi_oversold"] and rsi_4h <= 40:
-        signal = "BUY"
-        strength += 2
-        reasons.append(f"RSI перепродан ({rsi_1h} 1H / {rsi_4h} 4H)")
-    elif rsi_1h >= SIGNAL_CONFIG["rsi_overbought"] and rsi_4h >= 60:
-        signal = "SELL"
-        strength += 2
-        reasons.append(f"RSI перекуплен ({rsi_1h} 1H / {rsi_4h} 4H)")
-
-    if histogram > 0 and macd_val > signal_val:
-        if signal != "SELL":
-            signal = signal or "BUY"
-            strength += 1
-            reasons.append("MACD бычий перекрёсток")
-    elif histogram < 0 and macd_val < signal_val:
-        if signal != "BUY":
-            signal = signal or "SELL"
-            strength += 1
-            reasons.append("MACD медвежий перекрёсток")
-
-    if volume_spike >= SIGNAL_CONFIG["volume_spike"]:
-        strength += 1
-        reasons.append(f"Всплеск объёма (x{volume_spike})")
-
-    if abs(price_change) >= SIGNAL_CONFIG["price_change_24h"]:
-        strength += 1
-        reasons.append(f"Сильное движение 24ч ({price_change:+.2f}%)")
-
-    price_pos = (price - low_24h) / (high_24h - low_24h) if high_24h != low_24h else 0.5
-    if price_pos < 0.1:
-        signal = signal or "BUY"
-        strength += 1
-        reasons.append(f"Цена у поддержки ({price_pos:.1%} от диапазона)")
-    elif price_pos > 0.9:
-        signal = signal or "SELL"
-        strength += 1
-        reasons.append(f"Цена у сопротивления ({price_pos:.1%} от диапазона)")
-
-    if bb_lower and price < bb_lower:
-        signal = signal or "BUY"
-        strength += 1
-        reasons.append("Цена ниже нижней полосы Боллинджера")
-    elif bb_upper and price > bb_upper:
-        signal = signal or "SELL"
-        strength += 1
-        reasons.append("Цена выше верхней полосы Боллинджера")
-
-    levels = {}
-    if signal in ["BUY", "SELL"]:
-        levels = calculate_levels(signal, price, atr, support, resistance, bb_upper, bb_lower)
-        if levels.get("risk_reward_1", 0) < SIGNAL_CONFIG["risk_reward_min"]:
-            signal = None
-            strength = 0
-            reasons.append("Отменено: R:R слишком низкое")
-            levels = {}
-
+            
+        tp1 = round(entry + risk * 1.5, 8)
+        tp2 = round(entry + risk * 3.0, 8)
+        tp3 = round(entry + risk * 5.0, 8)
+        rr = round((tp1 - entry) / risk, 2)
+        
+    else:  # SELL
+        sl_atr = entry + (atr * cfg["atr_multiplier"])
+        sl_pct = entry * (1 + cfg["stop_loss_pct"] / 100)
+        sl_resistance = resistance * 1.002
+        
+        stop_loss = max(sl_atr, sl_pct, sl_resistance)
+        
+        if stop_loss - entry < min_risk:
+            stop_loss = entry + min_risk
+            
+        stop_loss = round(stop_loss, 8)
+        risk = stop_loss - entry
+        
+        if risk <= 0:
+            return None
+            
+        tp1 = round(entry - risk * 1.5, 8)
+        tp2 = round(entry - risk * 3.0, 8)
+        tp3 = round(entry - risk * 5.0, 8)
+        rr = round((entry - tp1) / risk, 2)
+    
     return {
-        "symbol": symbol.upper(), "price": price, "price_change_24h": price_change,
-        "high_24h": high_24h, "low_24h": low_24h, "quote_volume_24h": volume_24h,
-        "market_cap": market_cap, "rsi_1h": rsi_1h, "rsi_4h": rsi_4h,
-        "macd": round(macd_val, 4), "macd_signal": round(signal_val, 4),
-        "macd_histogram": round(histogram, 4), "atr": atr,
-        "bb_upper": bb_upper, "bb_mid": bb_mid, "bb_lower": bb_lower,
-        "support": support, "resistance": resistance, "volume_spike": volume_spike,
-        "signal": signal, "signal_strength": strength, "reasons": reasons,
-        "levels": levels, "timestamp": datetime.now().strftime("%H:%M:%S")
+        "entry": round(entry, 8),
+        "stop_loss": stop_loss,
+        "take_profit_1": tp1,
+        "take_profit_2": tp2,
+        "take_profit_3": tp3,
+        "risk_reward": rr,
+        "risk_amount": round(risk, 8)
     }
 
+def calculate_stars(rsi, rr, volume_change, trend_strength):
+    """Расчёт силы сигнала по звёздам"""
+    stars = 1
+    
+    # RSI экстремум
+    if rsi < 20 or rsi > 80:
+        stars += 2
+    elif rsi < 30 or rsi > 70:
+        stars += 1
+    
+    # R:R
+    if rr >= 3.0:
+        stars += 1
+    elif rr >= 2.0:
+        stars += 0.5
+    
+    # Тренд
+    if abs(trend_strength) > 5:
+        stars += 0.5
+    
+    return min(int(stars), 5)
 
-# ============ ФОРМАТИРОВАНИЕ ============
+def analyze_coin(coin_id="bitcoin"):
+    """Полный анализ монеты"""
+    # Получаем данные
+    coin_data = get_coin_data(coin_id)
+    if not coin_data:
+        return None
+    
+    chart_data = get_market_chart(coin_id, days=30)
+    if not chart_data or "prices" not in chart_data:
+        return None
+    
+    prices = [p[1] for p in chart_data["prices"]]
+    highs = [p[1] for p in chart_data.get("market_caps", [])]  # Используем как приближение
+    lows = prices  # Упрощение
+    
+    if len(prices) < 20:
+        return None
+    
+    current_price = prices[-1]
+    market_data = coin_data.get("market_data", {})
+    
+    # Индикаторы
+    rsi = calculate_rsi(prices)
+    atr = calculate_atr(highs, lows, prices)
+    bb_upper, bb_lower = calculate_bollinger(prices)
+    
+    # Уровни поддержки/сопротивления (простые)
+    recent_prices = prices[-20:]
+    support = min(recent_prices)
+    resistance = max(recent_prices)
+    
+    # Определение сигнала
+    signal_type = "NEUTRAL"
+    confidence = 0
+    
+    # BUY условия
+    if rsi < 35 and current_price <= bb_lower * 1.02:
+        signal_type = "BUY"
+        confidence = (35 - rsi) / 35 * 50 + 50
+    # SELL условия
+    elif rsi > 65 and current_price >= bb_upper * 0.98:
+        signal_type = "SELL"
+        confidence = (rsi - 65) / 35 * 50 + 50
+    
+    if signal_type == "NEUTRAL":
+        return None
+    
+    # Расчёт уровней
+    levels = calculate_levels(signal_type, current_price, atr, support, resistance)
+    if not levels:
+        return None
+    
+    # Сила сигнала
+    change_24h = market_data.get("price_change_percentage_24h", 0) or 0
+    trend_strength = (prices[-1] - prices[-5]) / prices[-5] * 100 if len(prices) >= 5 else 0
+    
+    stars = calculate_stars(rsi, levels["risk_reward"], 0, trend_strength)
+    
+    return {
+        "coin": coin_data.get("symbol", coin_id).upper(),
+        "name": coin_data.get("name", coin_id),
+        "signal": signal_type,
+        "entry": levels["entry"],
+        "stop_loss": levels["stop_loss"],
+        "take_profit_1": levels["take_profit_1"],
+        "take_profit_2": levels["take_profit_2"],
+        "take_profit_3": levels["take_profit_3"],
+        "risk_reward": levels["risk_reward"],
+        "stars": stars,
+        "rsi": rsi,
+        "change_24h": round(change_24h, 2),
+        "price": current_price,
+        "volume": market_data.get("total_volume", {}).get("usd", 0),
+        "market_cap": market_data.get("market_cap", {}).get("usd", 0)
+    }
 
-def format_signal(a: dict) -> str:
-    symbol = a["symbol"]
-    price = a["price"]
-    change = a["price_change_24h"]
-    signal = a["signal"]
-    strength = a["signal_strength"]
-    reasons = a["reasons"]
-    levels = a.get("levels", {})
-    market_cap = a.get("market_cap", 0)
+# ==================== ФОРМАТИРОВАНИЕ ====================
+def format_signal(signal):
+    """Красивое форматирование сигнала"""
+    stars_text = SIGNAL_STARS.get(signal["stars"], "⭐ Неизвестно")
+    emoji = "🟢" if signal["signal"] == "BUY" else "🔴"
+    
+    message = f"""
+{emoji} <b>{signal['coin']} — {signal['signal']}</b> {stars_text}
+━━━━━━━━━━━━━━━━━━━━━
+💰 <b>Вход:</b> ${signal['entry']:,.8f}
+🛑 <b>Стоп-лосс:</b> ${signal['stop_loss']:,.8f}
+🎯 <b>TP1:</b> ${signal['take_profit_1']:,.8f}
+🎯 <b>TP2:</b> ${signal['take_profit_2']:,.8f}
+🎯 <b>TP3:</b> ${signal['take_profit_3']:,.8f}
+📊 <b>R:R</b> 1:{signal['risk_reward']}
 
-    if signal == "BUY":
-        emoji, signal_text = "🟢", "📈 СИГНАЛ НА ПОКУПКУ"
-    elif signal == "SELL":
-        emoji, signal_text = "🔴", "📉 СИГНАЛ НА ПРОДАЖУ"
-    else:
-        emoji, signal_text = "⚪", "⏳ НЕЙТРАЛЬНО — НЕТ СИГНАЛА"
+📉 <b>RSI:</b> {signal['rsi']} | 24ч: {signal['change_24h']}%
+💵 <b>Цена:</b> ${signal['price']:,.8f}
+"""
+    return message
 
-    stars = "⭐" * min(strength, 5) + "☆" * max(0, 5 - strength)
-    change_emoji = "📈" if change >= 0 else "📉"
-    mc_str = f"${market_cap/1e9:.1f}B" if market_cap >= 1e9 else f"${market_cap/1e6:.1f}M" if market_cap >= 1e6 else f"${market_cap:,.0f}"
-
-    lines = [
-        f"{emoji} <b>{symbol}/USDT</b> {emoji}", "",
-        f"<b>{signal_text}</b>",
-        f"Сила сигнала: {stars}", "",
-        f"💰 <b>Текущая цена:</b> <code>${price:,.4f}</code>",
-        f"{change_emoji} <b>Изменение 24ч:</b> <code>{change:+.2f}%</code>",
-        f"📊 <b>Объём 24ч:</b> <code>${a['quote_volume_24h']:,.0f}</code>",
-        f"🏦 <b>Капитализация:</b> <code>{mc_str}</code>",
+# ==================== КЛАВИАТУРА ====================
+def get_main_menu():
+    """Постоянное меню"""
+    keyboard = [
+        ["📈 Сигнал", "📊 Обзор рынка"],
+        ["🔍 Сканер", "🔝 Топ"],
+        ["🔔 Алерты", "📈 Статистика"],
+        ["📚 Помощь"]
     ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-    if levels:
-        entry, sl = levels["entry"], levels["stop_loss"]
-        tp1, tp2, tp3 = levels["take_profit_1"], levels["take_profit_2"], levels["take_profit_3"]
-        rr, risk = levels["risk_reward_1"], levels["risk_amount"]
-        sl_pct = abs((sl - entry) / entry * 100)
-        tp1_pct = abs((tp1 - entry) / entry * 100)
-        tp2_pct = abs((tp2 - entry) / entry * 100)
-        tp3_pct = abs((tp3 - entry) / entry * 100)
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Старт"""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    
+    # Сохраняем пользователя
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''INSERT OR REPLACE INTO users 
+                 (user_id, username, first_name, last_name, chat_id)
+                 VALUES (?, ?, ?, ?, ?)''',
+              (user.id, user.username, user.first_name, user.last_name, chat_id))
+    conn.commit()
+    conn.close()
+    
+    welcome = f"""
+👋 <b>Привет, {user.first_name}!</b>
 
-        lines.extend([
-            "", "╔════════════════════════════════════════╗",
-            "║     📍 УРОВНИ ТОРГОВЛИ                ║",
-            "╠════════════════════════════════════════╣",
-            f"║  🎯 <b>Вход:</b>          <code>${entry:,.4f}</code>           ║",
-            f"║  🛑 <b>Стоп-лосс:</b>    <code>${sl:,.4f}</code>  ({sl_pct:.1f}%)   ║",
-            "╠════════════════════════════════════════╣",
-            f"║  💎 <b>Тейк 1:</b>       <code>${tp1:,.4f}</code>  (+{tp1_pct:.1f}%)  ║",
-            f"║  💎💎 <b>Тейк 2:</b>     <code>${tp2:,.4f}</code>  (+{tp2_pct:.1f}%)  ║",
-            f"║  💎💎💎 <b>Тейк 3:</b>   <code>${tp3:,.4f}</code>  (+{tp3_pct:.1f}%)  ║",
-            "╠════════════════════════════════════════╣",
-            f"║  ⚖️ <b>Risk/Reward:</b>  <code>1:{rr}</code>              ║",
-            f"║  📏 <b>Риск:</b>         <code>${risk:,.4f}</code>           ║",
-            "╚════════════════════════════════════════╝", "",
-            "<b>📋 План сделки:</b>",
-            f"  1️⃣ Вход по рынку или лимиткой ~${entry:,.4f}",
-            f"  2️⃣ Стоп-лосс на ${sl:,.4f} ({sl_pct:.1f}%)",
-            f"  3️⃣ 50% позиции закрыть на TP1 (${tp1:,.4f})",
-            f"  4️⃣ 30% позиции закрыть на TP2 (${tp2:,.4f})",
-            f"  5️⃣ 20% позиции закрыть на TP3 (${tp3:,.4f})",
-            "  6️⃣ Стоп в безубыток после достижения TP1",
-        ])
+🤖 <b>Crypto Signal Bot v7.0</b>
+Автоматические сигналы на основе технического анализа.
 
-    lines.extend([
-        "", f"📉 <b>RSI:</b> <code>{a['rsi_1h']} (1H)</code> | <code>{a['rsi_4h']} (4H)</code>",
-        f"📊 <b>MACD:</b> <code>{a['macd']}</code> | Signal: <code>{a['macd_signal']}</code>",
-        f"📦 <b>Всплеск объёма:</b> <code>x{a['volume_spike']}</code>",
-        f"📏 <b>ATR:</b> <code>${a['atr']:,.4f}</code>", "",
-        "<b>Уровни:</b>",
-        f"  🔺 Сопротивление: <code>${a['resistance']:,.4f}</code>",
-        f"  🔻 Поддержка: <code>${a['support']:,.4f}</code>",
-        f"  ⬆️ BB Upper: <code>${a['bb_upper']:,.4f}</code>",
-        f"  ⬇️ BB Lower: <code>${a['bb_lower']:,.4f}</code>", "",
-        "🔍 <b>Причины сигнала:</b>",
-    ])
-    for r in reasons:
-        lines.append(f"  • {r}")
-    lines.extend([
-        "", f"⏰ <i>Обновлено: {a['timestamp']}</i>", "",
-        "⚠️ <i>Не финансовый совет. Управляй рисками. DYOR!</i>", "",
-        "<i>💡 Данные: CoinGecko API</i>",
-    ])
-    return "\n".join(lines)
+📊 <b>Возможности:</b>
+• Сигналы BUY/SELL с уровнями
+• Автосканер каждые 10 минут
+• Алерты на цену
+• Статистика сигналов
 
+Выбери действие в меню ниже 👇
+"""
+    await update.message.reply_text(welcome, parse_mode="HTML", reply_markup=get_main_menu())
 
-def format_watchlist(analyses: List[dict]) -> str:
-    lines = ["📊 <b>ОБЗОР РЫНКА</b>", "",
-             "<code>АКТИВ    ЦЕНА          24Ч%   RSI   СИГНАЛ  R:R</code>",
-             "<code>─────────────────────────────────────────────────</code>"]
-    for a in analyses:
-        sym = a["symbol"].ljust(6)
-        price = f"${a['price']:,.4f}".rjust(12)
-        change = f"{a['price_change_24h']:+.1f}%".rjust(6)
-        rsi = f"{a['rsi_1h']:.0f}".rjust(5)
-        if a["signal"] == "BUY":
-            sig, rr = "🟢BUY", a.get("levels", {}).get("risk_reward_1", 0)
-            rr_str = f"1:{rr}" if rr else "—"
-        elif a["signal"] == "SELL":
-            sig, rr = "🔴SELL", a.get("levels", {}).get("risk_reward_1", 0)
-            rr_str = f"1:{rr}" if rr else "—"
-        else:
-            sig, rr_str = "⚪—", "—"
-        lines.append(f"<code>{sym} {price} {change} {rsi} {sig.ljust(7)} {rr_str}</code>")
-    lines.extend([f"⏰ <i>{datetime.now().strftime('%d.%m.%Y %H:%M:%S')}</i>", "", "<i>💡 Данные: CoinGecko API</i>"])
-    return "\n".join(lines)
-
-
-# ============ ОБРАБОТЧИКИ КОМАНД ============
-
-def cmd_start(chat_id: int):
-    welcome = ("🤖 <b>Crypto Signal Bot v6.4</b>\n\n"
-        "Я анализирую рынок через <b>CoinGecko API</b> и даю готовые торговые сигналы с:\n"
-        "• 🎯 <b>Точкой входа</b>\n"
-        "• 🛑 <b>Стоп-лоссом</b>\n"
-        "• 💎 <b>3 тейк-профитами</b>\n"
-        "• ⚖️ <b>Соотношением Risk/Reward</b>\n\n"
-        "<b>Команды:</b>\n"
-        "/signal [монета] — Сигнал с уровнями\n"
-        "/signals — Все активные сигналы\n"
-        "/watchlist — Обзор рынка\n"
-        "/top — Топ движений\n"
-        "/scanner — Автосканер сигналов\n"
-        "/help — Справка\n\n"
-        "⚠️ <i>Не финансовый совет. Управляй рисками!</i>")
-    kb = {"inline_keyboard": [
-        [{"text": "📈 Сигнал BTC", "callback_data": "signal_BTC"}],
-        [{"text": "📊 Обзор рынка", "callback_data": "watchlist"}],
-        [{"text": "🔍 Сканер", "callback_data": "scanner"}]
-    ]}
-    send_message(chat_id, welcome, reply_markup=kb)
-
-
-def cmd_help(chat_id: int):
-    help_text = ("<b>📚 Справка</b>\n\n"
-        "<b>/signal [монета]</b> — Детальный сигнал с уровнями\n"
-        "  Пример: /signal BTC, /signal ETH\n\n"
-        "<b>/signals</b> — Все активные BUY/SELL сигналы\n\n"
-        "<b>/watchlist</b> — Таблица всех пар с R:R\n\n"
-        "<b>/top</b> — Топ-10 движений за 24ч\n\n"
-        "<b>/scanner</b> — Автоматический поиск сигналов\n\n"
-        "<b>Уровни:</b>\n"
-        "🎯 Вход — рекомендуемая цена входа\n"
-        "🛑 Стоп-лосс — уровень фиксации убытка\n"
-        "💎 TP1/TP2/TP3 — цели фиксации прибыли\n"
-        "⚖️ R:R — соотношение риска к прибыли\n\n"
-        "<b>Правила:</b>\n"
-        "• Входить только при R:R >= 2.0\n"
-        "• Стоп всегда ставить!\n"
-        "• 50% закрывать на TP1, стоп в БУ\n"
-        "• Не рисковать >2% депозита на сделку")
-    send_message(chat_id, help_text)
-
-
-def cmd_signal(chat_id: int, args: list):
-    symbol = args[0].upper() if args else "BTC"
-    if symbol not in COIN_MAP:
-        send_message(chat_id, f"❌ {symbol} не найден. Попробуй /watchlist")
+async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сигнал на конкретную монету"""
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "❌ Укажи монету: /signal BTC\nИли выбери из топа: /top",
+            reply_markup=get_main_menu()
+        )
         return
-    msg = send_message(chat_id, f"🔍 Анализ {symbol}/USDT...")
-    a = analyze_symbol(symbol)
-    if not a:
-        edit_message(chat_id, msg["result"]["message_id"], "❌ Не удалось получить данные. Попробуй позже.")
-        return
-    text = format_signal(a)
-    kb = {"inline_keyboard": [
-        [{"text": "🔄 Обновить", "callback_data": f"signal_{a['symbol']}"}],
-        [{"text": "📊 CoinGecko", "url": f"https://www.coingecko.com/en/coins/{COIN_MAP[a['symbol']]}"}]
-    ]}
-    edit_message(chat_id, msg["result"]["message_id"], text, reply_markup=kb)
-
-
-def cmd_signals(chat_id: int):
-    msg = send_message(chat_id, "🔍 Ищу сигналы...")
-    analyses = []
-    for s in WATCHLIST[:10]:
-        a = analyze_symbol(s)
-        if a and a["signal"] in ["BUY", "SELL"]:
-            analyses.append(a)
-    analyses.sort(key=lambda x: x["signal_strength"], reverse=True)
-    if not analyses:
-        edit_message(chat_id, msg["result"]["message_id"], "⚪ Нет сильных сигналов. Рынок в боковике.")
-        return
-    lines = [f"🎯 <b>АКТИВНЫЕ СИГНАЛЫ ({len(analyses)})</b>", ""]
-    for a in analyses[:10]:
-        emoji = "🟢" if a["signal"] == "BUY" else "🔴"
-        stars = "⭐" * a["signal_strength"]
-        levels = a.get("levels", {})
-        rr = levels.get("risk_reward_1", 0)
-        entry = levels.get("entry", a["price"])
-        sl = levels.get("stop_loss", 0)
-        tp1 = levels.get("take_profit_1", 0)
-        lines.append(f"{emoji} <b>{a['symbol']}</b> {stars} | R:R 1:{rr}")
-        lines.append(f"   Вход: ${entry:,.4f} | SL: ${sl:,.4f} | TP1: ${tp1:,.4f}")
-        lines.append(f"   RSI: {a['rsi_1h']} | 24ч: {a['price_change_24h']:+.1f}%")
-        lines.append("")
-    kb = {"inline_keyboard": [[{"text": "🔄 Обновить", "callback_data": "signals_refresh"}]]}
-    edit_message(chat_id, msg["result"]["message_id"], "\n".join(lines), reply_markup=kb)
-
-
-def cmd_watchlist(chat_id: int):
-    msg = send_message(chat_id, "📊 Загружаю рынок...")
-    analyses = []
-    for s in WATCHLIST[:10]:
-        a = analyze_symbol(s)
-        if a:
-            analyses.append(a)
-    analyses.sort(key=lambda x: x.get("quote_volume_24h", 0), reverse=True)
-    text = format_watchlist(analyses)
-    kb = {"inline_keyboard": [[{"text": "🔄 Обновить", "callback_data": "watchlist"}]]}
-    edit_message(chat_id, msg["result"]["message_id"], text, reply_markup=kb)
-
-
-def cmd_top(chat_id: int):
-    msg = send_message(chat_id, "🔝 Ищу топ...")
-    markets = cg.get_markets(per_page=100)
-    if not markets:
-        edit_message(chat_id, msg["result"]["message_id"], "❌ Ошибка получения данных")
-        return
-    markets.sort(key=lambda x: abs(x.get("price_change_percentage_24h_in_currency", 0) or 0), reverse=True)
-    lines = ["🔝 <b>ТОП-10 ДВИЖЕНИЙ (24ч)</b>", ""]
-    for i, t in enumerate(markets[:10], 1):
-        sym = t["symbol"].upper()
-        change = t.get("price_change_percentage_24h_in_currency", 0) or 0
-        price = t.get("current_price", 0)
-        vol = t.get("total_volume", 0)
-        mc = t.get("market_cap", 0)
-        emoji = "🚀" if change > 10 else "📈" if change > 0 else "💥" if change < -10 else "📉"
-        lines.append(f"{i}. {emoji} <b>{sym}</b>")
-        lines.append(f"   ${price:,.4f} | {change:+.2f}% | Объём: ${vol/1e6:.1f}M | Кап: ${mc/1e9:.1f}B")
-        lines.append("")
-    edit_message(chat_id, msg["result"]["message_id"], "\n".join(lines))
-
-
-def cmd_scanner(chat_id: int):
-    msg = send_message(chat_id, "🔍 Сканирую рынок...\nЭто может занять 20-30 секунд...")
-    results = []
-    for s in WATCHLIST[:10]:
-        a = analyze_symbol(s)
-        if a:
-            results.append(a)
-    good_signals = []
-    for r in results:
-        if r["signal"] == "BUY":
-            levels = r.get("levels", {})
-            rr = levels.get("risk_reward_1", 0)
-            if rr >= 2.0 and r["signal_strength"] >= 3:
-                good_signals.append(r)
-    good_signals.sort(key=lambda x: (x.get("levels", {}).get("risk_reward_1", 0), x["signal_strength"]), reverse=True)
-    if not good_signals:
-        edit_message(chat_id, msg["result"]["message_id"], "⚪ Нет качественных сигналов с R:R >= 2.0. Попробуй позже.")
-        return
-    lines = [f"🔍 <b>ЛУЧШИЕ СИГНАЛЫ (R:R >= 2.0)</b>", f"Найдено: {len(good_signals)} сигналов", ""]
-    for a in good_signals[:5]:
-        levels = a["levels"]
-        stars = "⭐" * a["signal_strength"]
-        lines.append(f"🟢 <b>{a['symbol']}</b> {stars} | R:R 1:{levels['risk_reward_1']}")
-        lines.append(f"   🎯 Вход: ${levels['entry']:,.4f}")
-        lines.append(f"   🛑 Стоп: ${levels['stop_loss']:,.4f} ({abs((levels['stop_loss']-levels['entry'])/levels['entry']*100):.1f}%)")
-        lines.append(f"   💎 TP1: ${levels['take_profit_1']:,.4f} | TP2: ${levels['take_profit_2']:,.4f} | TP3: ${levels['take_profit_3']:,.4f}")
-        lines.append(f"   RSI: {a['rsi_1h']} | Объём: x{a['volume_spike']}")
-        lines.append("")
-    kb = {"inline_keyboard": [
-        [{"text": "🔄 Пересканировать", "callback_data": "scanner"}],
-        [{"text": "📈 Сигнал BTC", "callback_data": "signal_BTC"}]
-    ]}
-    edit_message(chat_id, msg["result"]["message_id"], "\n".join(lines), reply_markup=kb)
-
-
-def cmd_status(chat_id: int):
-    status = (f"🤖 <b>Статус бота v6.4</b>\n\n"
-        f"✅ Онлайн\n"
-        f"📡 CoinGecko API\n"
-        f"🔑 API Key: {'✅ Да' if CG_API_KEY else '❌ Нет (keyless)'}\n"
-        f"📊 Пар: {len(WATCHLIST)}\n"
-        f"🔄 Mode: {'Polling' if USE_POLLING else 'Webhook'}\n\n"
-        f"<b>Настройки:</b>\n"
-        f"• RSI: {SIGNAL_CONFIG['rsi_oversold']}-{SIGNAL_CONFIG['rsi_overbought']}\n"
-        f"• Стоп-лосс: {SIGNAL_CONFIG['stop_loss_pct']}%\n"
-        f"• TP1: {SIGNAL_CONFIG['take_profit_1']}%\n"
-        f"• TP2: {SIGNAL_CONFIG['take_profit_2']}%\n"
-        f"• TP3: {SIGNAL_CONFIG['take_profit_3']}%\n"
-        f"• Мин. R:R: 1:{SIGNAL_CONFIG['risk_reward_min']}\n\n"
-        f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M:%S')}</i>")
-    send_message(chat_id, status)
-
-
-def handle_callback(query: dict):
-    chat_id = query["message"]["chat"]["id"]
-    message_id = query["message"]["message_id"]
-    data = query["data"]
-    tg_post("answerCallbackQuery", {"callback_query_id": query["id"], "text": "Обрабатываю..."})
-    if data.startswith("signal_"):
-        symbol = data.split("_")[1].upper()
-        a = analyze_symbol(symbol)
-        if a:
-            text = format_signal(a)
-            kb = {"inline_keyboard": [
-                [{"text": "🔄 Обновить", "callback_data": f"signal_{a['symbol']}"}],
-                [{"text": "📊 CoinGecko", "url": f"https://www.coingecko.com/en/coins/{COIN_MAP.get(a['symbol'], '')}"}]
-            ]}
-            edit_message(chat_id, message_id, text, reply_markup=kb)
-    elif data == "watchlist":
-        analyses = [analyze_symbol(s) for s in WATCHLIST[:10]]
-        analyses = [r for r in analyses if r]
-        analyses.sort(key=lambda x: x.get("quote_volume_24h", 0), reverse=True)
-        edit_message(chat_id, message_id, format_watchlist(analyses),
-                     reply_markup={"inline_keyboard": [[{"text": "🔄 Обновить", "callback_data": "watchlist"}]]})
-    elif data == "scanner":
-        cmd_scanner(chat_id)
-    elif data == "signals_refresh":
-        cmd_signals(chat_id)
-
-
-def handle_message(msg: dict):
-    chat_id = msg["chat"]["id"]
-    text = msg.get("text", "")
-    if not text.startswith("/"):
-        return
-    parts = text.split()
-    cmd = parts[0].lower()
-    args = parts[1:]
-    if cmd == "/start":
-        cmd_start(chat_id)
-    elif cmd == "/help":
-        cmd_help(chat_id)
-    elif cmd == "/signal":
-        cmd_signal(chat_id, args)
-    elif cmd == "/signals":
-        cmd_signals(chat_id)
-    elif cmd == "/watchlist":
-        cmd_watchlist(chat_id)
-    elif cmd == "/top":
-        cmd_top(chat_id)
-    elif cmd == "/scanner":
-        cmd_scanner(chat_id)
-    elif cmd == "/status":
-        cmd_status(chat_id)
+    
+    coin = args[0].lower()
+    # Маппинг популярных монет
+    coin_map = {
+        "btc": "bitcoin", "eth": "ethereum", "bnb": "binancecoin",
+        "sol": "solana", "xrp": "ripple", "doge": "dogecoin",
+        "ada": "cardano", "avax": "avalanche-2", "dot": "polkadot",
+        "matic": "matic-network", "link": "chainlink", "ltc": "litecoin"
+    }
+    coin_id = coin_map.get(coin, coin)
+    
+    await update.message.reply_text(f"🔍 Анализирую {coin.upper()}...", reply_markup=get_main_menu())
+    
+    signal = analyze_coin(coin_id)
+    if signal:
+        msg = format_signal(signal)
+        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_menu())
+        
+        # Сохраняем в БД
+        conn = get_db()
+        c = conn.cursor()
+        try:
+            c.execute('''INSERT INTO signals 
+                         (coin, signal_type, entry, stop_loss, take_profit_1, 
+                          take_profit_2, take_profit_3, risk_reward, stars, rsi, change_24h)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                      (signal["coin"], signal["signal"], signal["entry"], 
+                       signal["stop_loss"], signal["take_profit_1"], signal["take_profit_2"],
+                       signal["take_profit_3"], signal["risk_reward"], signal["stars"],
+                       signal["rsi"], signal["change_24h"]))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pass
+        conn.close()
     else:
-        send_message(chat_id, "❓ Неизвестная команда. Используй /help")
+        await update.message.reply_text(
+            f"⚠️ Нет сигнала для {coin.upper()}\nРынок нейтральный.",
+            reply_markup=get_main_menu()
+        )
 
+async def scanner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сканер рынка"""
+    await update.message.reply_text("🔍 Сканирую рынок...", reply_markup=get_main_menu())
+    
+    top_coins = get_top_coins(50)
+    signals_found = []
+    
+    for coin in top_coins[:20]:  # Проверяем топ-20
+        coin_id = coin.get("id")
+        if not coin_id:
+            continue
+            
+        try:
+            signal = analyze_coin(coin_id)
+            if signal and signal["stars"] >= 2:
+                signals_found.append(signal)
+        except Exception as e:
+            logger.error(f"Error analyzing {coin_id}: {e}")
+            continue
+    
+    # Сортируем по силе
+    signals_found.sort(key=lambda x: x["stars"], reverse=True)
+    
+    if not signals_found:
+        await update.message.reply_text(
+            "📊 Нет активных сигналов.\nРынок в боковике.",
+            reply_markup=get_main_menu()
+        )
+        return
+    
+    message = "🎯 <b>АКТИВНЫЕ СИГНАЛЫ</b> ({}/{})\n\n".format(len(signals_found), len(top_coins[:20]))
+    
+    for sig in signals_found[:5]:
+        stars = "⭐" * sig["stars"]
+        emoji = "🟢" if sig["signal"] == "BUY" else "🔴"
+        message += f"{emoji} <b>{sig['coin']}</b> {stars} | R:R 1:{sig['risk_reward']}\n"
+        message += f"   Вход: ${sig['entry']:,.6f} | SL: ${sig['stop_loss']:,.6f} | TP1: ${sig['take_profit_1']:,.6f}\n"
+        message += f"   RSI: {sig['rsi']} | 24ч: {sig['change_24h']}%\n\n"
+    
+    await update.message.reply_text(message, parse_mode="HTML", reply_markup=get_main_menu())
 
-# ============ FLASK ROUTES ============
+async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Топ монет"""
+    await update.message.reply_text("📊 Загружаю топ...", reply_markup=get_main_menu())
+    
+    coins = get_top_coins(10)
+    message = "🔝 <b>ТОП-10 КРИПТО</b>\n\n"
+    
+    for i, coin in enumerate(coins, 1):
+        symbol = coin.get("symbol", "?").upper()
+        price = coin.get("current_price", 0)
+        change = coin.get("price_change_percentage_24h", 0) or 0
+        emoji = "🟢" if change >= 0 else "🔴"
+        
+        message += f"{i}. <b>{symbol}</b> — ${price:,.2f} {emoji} {change:+.2f}%\n"
+    
+    await update.message.reply_text(message, parse_mode="HTML", reply_markup=get_main_menu())
+
+async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Установка алерта: /alert BTC above 70000"""
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(
+            "❌ Формат: /alert BTC above 70000\nили: /alert ETH below 2000",
+            reply_markup=get_main_menu()
+        )
+        return
+    
+    coin = args[0].upper()
+    condition = args[1].lower()
+    try:
+        target = float(args[2])
+    except ValueError:
+        await update.message.reply_text("❌ Цена должна быть числом", reply_markup=get_main_menu())
+        return
+    
+    if condition not in ["above", "below"]:
+        await update.message.reply_text(
+            "❌ Условие: above (выше) или below (ниже)",
+            reply_markup=get_main_menu()
+        )
+        return
+    
+    user_id = update.effective_user.id
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''INSERT INTO alerts (user_id, coin, condition, target_price)
+                 VALUES (?, ?, ?, ?)''',
+              (user_id, coin, condition, target))
+    conn.commit()
+    conn.close()
+    
+    emoji = "⬆️" if condition == "above" else "⬇️"
+    await update.message.reply_text(
+        f"🔔 <b>Алерт установлен!</b>\n\n{coin} {emoji} {condition} ${target:,.2f}",
+        parse_mode="HTML",
+        reply_markup=get_main_menu()
+    )
+
+async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Мои алерты"""
+    user_id = update.effective_user.id
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''SELECT coin, condition, target_price, triggered 
+                 FROM alerts WHERE user_id = ? ORDER BY created_at DESC''',
+              (user_id,))
+    alerts = c.fetchall()
+    conn.close()
+    
+    if not alerts:
+        await update.message.reply_text(
+            "🔕 У тебя нет активных алертов.\nУстанови: /alert BTC above 70000",
+            reply_markup=get_main_menu()
+        )
+        return
+    
+    message = "🔔 <b>ТВОИ АЛЕРТЫ</b>\n\n"
+    for coin, condition, price, triggered in alerts:
+        status = "✅" if triggered else "⏳"
+        emoji = "⬆️" if condition == "above" else "⬇️"
+        message += f"{status} {coin} {emoji} {condition} ${price:,.2f}\n"
+    
+    await update.message.reply_text(message, parse_mode="HTML", reply_markup=get_main_menu())
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика сигналов"""
+    conn = get_db()
+    c = conn.cursor()
+    
+    # Общая статистика
+    c.execute('SELECT COUNT(*) FROM signals')
+    total = c.fetchone()[0]
+    
+    c.execute('SELECT COUNT(*) FROM signals WHERE signal_type = "BUY"')
+    buys = c.fetchone()[0]
+    
+    c.execute('SELECT COUNT(*) FROM signals WHERE signal_type = "SELL"')
+    sells = c.fetchone()[0]
+    
+    c.execute('SELECT AVG(stars) FROM signals')
+    avg_stars = c.fetchone()[0] or 0
+    
+    # Последние 5 сигналов
+    c.execute('''SELECT coin, signal_type, entry, risk_reward, stars, sent_at 
+                 FROM signals ORDER BY sent_at DESC LIMIT 5''')
+    recent = c.fetchall()
+    
+    conn.close()
+    
+    message = f"""
+📈 <b>СТАТИСТИКА СИГНАЛОВ</b>
+
+Всего сигналов: {total}
+🟢 BUY: {buys} | 🔴 SELL: {sells}
+⭐ Средняя сила: {avg_stars:.1f}
+
+<b>Последние сигналы:</b>
+"""
+    for coin, sig_type, entry, rr, stars, date in recent:
+        emoji = "🟢" if sig_type == "BUY" else "🔴"
+        star_str = "⭐" * stars
+        message += f"{emoji} {coin} {star_str} | R:R 1:{rr} | ${entry:,.6f}\n"
+    
+    await update.message.reply_text(message, parse_mode="HTML", reply_markup=get_main_menu())
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Помощь"""
+    help_text = """
+📚 <b>ПОМОЩЬ</b>
+
+<b>Команды:</b>
+/start — Начать
+/signal BTC — Сигнал на монету
+/scanner — Сканер рынка
+/top — Топ монет
+/alert BTC above 70000 — Алерт на цену
+/alerts — Мои алерты
+/stats — Статистика
+
+<b>Меню:</b>
+📈 Сигнал — быстрый сигнал
+📊 Обзор — обзор рынка
+🔍 Сканер — поиск сигналов
+🔝 Топ — топ-10 монет
+🔔 Алерты — управление алертами
+📈 Статистика — история
+
+<b>Автосканер:</b>
+Бот проверяет рынок каждые 10 минут и шлёт сигналы:
+• 4-5⭐ — мощные, повторяются
+• 1-3⭐ — отправляются один раз
+"""
+    await update.message.reply_text(help_text, parse_mode="HTML", reply_markup=get_main_menu())
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстовых кнопок меню"""
+    text = update.message.text
+    
+    if "Сигнал" in text:
+        await update.message.reply_text(
+            "Введи: /signal BTC\nили выбери из /top",
+            reply_markup=get_main_menu()
+        )
+    elif "Обзор" in text:
+        await scanner_command(update, context)
+    elif "Сканер" in text:
+        await scanner_command(update, context)
+    elif "Топ" in text:
+        await top_command(update, context)
+    elif "Алерты" in text:
+        await alerts_command(update, context)
+    elif "Статистика" in text:
+        await stats_command(update, context)
+    elif "Помощь" in text:
+        await help_command(update, context)
+    else:
+        # Пробуем как сигнал
+        await signal_command(update, context)
+
+# ==================== АВТОСКАНЕР ====================
+def should_send_signal(coin, signal_type, stars):
+    """Проверить, нужно ли отправлять сигнал"""
+    conn = get_db()
+    c = conn.cursor()
+    
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    # Проверяем, отправляли ли сегодня
+    c.execute('''SELECT 1 FROM sent_signals 
+                 WHERE coin = ? AND signal_type = ? AND DATE(sent_at) = ?''',
+              (coin, signal_type, today))
+    
+    was_sent = c.fetchone() is not None
+    
+    # 4-5 звёзд — отправляем всегда (повторно)
+    if stars >= 4:
+        # Обновляем время отправки
+        c.execute('''INSERT OR REPLACE INTO sent_signals (coin, signal_type, stars, sent_at)
+                     VALUES (?, ?, ?, ?)''',
+                  (coin, signal_type, stars, datetime.now()))
+        conn.commit()
+        conn.close()
+        return True
+    
+    # 1-3 звёзд — отправляем один раз в день
+    if not was_sent:
+        c.execute('''INSERT INTO sent_signals (coin, signal_type, stars, sent_at)
+                     VALUES (?, ?, ?, ?)''',
+                  (coin, signal_type, stars, datetime.now()))
+        conn.commit()
+        conn.close()
+        return True
+    
+    conn.close()
+    return False
+
+def send_signal_to_users(signal, bot):
+    """Отправить сигнал всем пользователям"""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT chat_id, min_stars FROM users WHERE auto_signals = 1')
+    users = c.fetchall()
+    conn.close()
+    
+    msg = format_signal(signal)
+    
+    for chat_id, min_stars in users:
+        if signal["stars"] >= min_stars:
+            try:
+                bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+                time.sleep(0.1)  # Rate limit
+            except Exception as e:
+                logger.error(f"Failed to send to {chat_id}: {e}")
+
+def check_alerts(bot):
+    """Проверка алертов"""
+    conn = get_db()
+    c = conn.cursor()
+    
+    c.execute('''SELECT id, user_id, coin, condition, target_price 
+                 FROM alerts WHERE triggered = 0''')
+    alerts = c.fetchall()
+    
+    for alert_id, user_id, coin, condition, target in alerts:
+        # Получаем текущую цену (упрощённо)
+        try:
+            data = get_coin_data(coin.lower())
+            if not data:
+                continue
+            
+            price = data.get("market_data", {}).get("current_price", {}).get("usd", 0)
+            
+            triggered = False
+            if condition == "above" and price >= target:
+                triggered = True
+            elif condition == "below" and price <= target:
+                triggered = True
+            
+            if triggered:
+                c.execute('UPDATE alerts SET triggered = 1 WHERE id = ?', (alert_id,))
+                conn.commit()
+                
+                emoji = "🚀" if condition == "above" else "📉"
+                bot.send_message(
+                    chat_id=user_id,
+                    text=f"🔔 <b>АЛЕРТ СРАБОТАЛ!</b>\n\n{emoji} {coin} {condition} ${target:,.2f}\nТекущая цена: ${price:,.2f}",
+                    parse_mode="HTML"
+                )
+        except Exception as e:
+            logger.error(f"Alert check error: {e}")
+    
+    conn.close()
+
+def auto_scanner():
+    """Фоновый сканер"""
+    logger.info("Auto-scanner started")
+    
+    # Создаём бот для отправки
+    bot = telegram.Bot(TOKEN)
+    
+    while True:
+        try:
+            logger.info("Running auto-scan...")
+            
+            # Проверяем алерты
+            check_alerts(bot)
+            
+            # Сканируем топ монеты
+            top_coins = get_top_coins(50)
+            
+            for coin in top_coins[:30]:
+                coin_id = coin.get("id")
+                if not coin_id:
+                    continue
+                
+                try:
+                    signal = analyze_coin(coin_id)
+                    if signal and signal["stars"] >= 2:
+                        if should_send_signal(signal["coin"], signal["signal"], signal["stars"]):
+                            # Сохраняем в БД
+                            conn = get_db()
+                            c = conn.cursor()
+                            try:
+                                c.execute('''INSERT INTO signals 
+                                             (coin, signal_type, entry, stop_loss, take_profit_1, 
+                                              take_profit_2, take_profit_3, risk_reward, stars, rsi, change_24h)
+                                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                          (signal["coin"], signal["signal"], signal["entry"], 
+                                           signal["stop_loss"], signal["take_profit_1"], signal["take_profit_2"],
+                                           signal["take_profit_3"], signal["risk_reward"], signal["stars"],
+                                           signal["rsi"], signal["change_24h"]))
+                                conn.commit()
+                            except:
+                                pass
+                            conn.close()
+                            
+                            # Отправляем
+                            send_signal_to_users(signal, bot)
+                            
+                            # Лог админу для 5 звёзд
+                            if signal["stars"] == 5 and ADMIN_CHAT_ID:
+                                try:
+                                    bot.send_message(
+                                        chat_id=ADMIN_CHAT_ID,
+                                        text=f"⚡ <b>МОЩНЫЙ СИГНАЛ 5⭐</b>\n\n{format_signal(signal)}",
+                                        parse_mode="HTML"
+                                    )
+                                except:
+                                    pass
+                            
+                            time.sleep(1)
+                except Exception as e:
+                    logger.error(f"Scan error for {coin_id}: {e}")
+                    continue
+            
+            logger.info("Auto-scan completed")
+            
+        except Exception as e:
+            logger.error(f"Auto-scanner error: {e}")
+        
+        # Спим 10 минут
+        time.sleep(SIGNAL_CONFIG["scan_interval"])
+
+# ==================== FLASK WEBHOOK ====================
+app = Flask(__name__)
 
 @app.route('/')
-def index():
-    return 'Crypto Signal Bot v6.4 (CoinGecko) is running!'
-
+def home():
+    return "Crypto Signal Bot v7.0 is running!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    """Получаем обновления от Telegram"""
     try:
-        update = request.get_json()
-        if "message" in update:
-            handle_message(update["message"])
-        elif "callback_query" in update:
-            handle_callback(update["callback_query"])
+        update = Update.de_json(request.get_json(force=True), bot)
+        application.update_queue.put(update)
         return jsonify({"ok": True})
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "bot": "running", "api": "coingecko", "version": "6.4"})
+    return jsonify({"status": "ok", "version": "7.0"})
 
-
-# ============ ЗАПУСК ============
-
-def init_bot():
-    if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN не задан!")
-        return False
-
-    logger.info("🚀 Запуск Crypto Signal Bot v6.4 (CoinGecko)...")
-    logger.info(f"📡 CoinGecko API Key: {'✅' if CG_API_KEY else '❌ Keyless (2s delay)'}")
-    logger.info(f"🔄 Mode: {'Polling' if USE_POLLING else 'Webhook'}")
-
+# ==================== MAIN ====================
+def main():
+    global application, bot
+    
+    # Инициализация
+    init_db()
+    
+    # Создаём приложение
+    application = Application.builder().token(TOKEN).build()
+    bot = application.bot
+    
+    # Обработчики
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("signal", signal_command))
+    application.add_handler(CommandHandler("scanner", scanner_command))
+    application.add_handler(CommandHandler("top", top_command))
+    application.add_handler(CommandHandler("alert", alert_command))
+    application.add_handler(CommandHandler("alerts", alerts_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
     if USE_POLLING:
-        logger.info("🔄 Запуск polling...")
-        threading.Thread(target=polling_loop, daemon=True).start()
-        return True
-
-    if not WEBHOOK_URL:
-        logger.warning("⚠️ WEBHOOK_URL не установлен, запускаем polling...")
-        threading.Thread(target=polling_loop, daemon=True).start()
-        return True
-
-    webhook_full_url = f"{WEBHOOK_URL}/webhook"
-    logger.info(f"🔧 Настройка webhook: {webhook_full_url}")
-
-    info = get_webhook_info()
-    if info:
-        logger.info(f"📡 Текущий webhook: {info.get('result', {})}")
-
-    delete_webhook()
-    time.sleep(1)
-
-    result = set_webhook(webhook_full_url)
-    if result and result.get("ok"):
-        logger.info(f"✅ Webhook установлен: {webhook_full_url}")
-        return True
+        # Локальный polling
+        logger.info("Starting polling...")
+        application.run_polling()
     else:
-        logger.error(f"❌ Webhook не установлен: {result}")
-        logger.info("🔄 Переключаемся на polling mode...")
-        threading.Thread(target=polling_loop, daemon=True).start()
-        return True
-
+        # Webhook для Render
+        logger.info("Starting webhook...")
+        
+        # Устанавливаем webhook
+        webhook_url = f"{WEBHOOK_URL}/webhook"
+        try:
+            bot.delete_webhook()
+            time.sleep(1)
+            bot.set_webhook(url=webhook_url)
+            logger.info(f"Webhook set to {webhook_url}")
+        except Exception as e:
+            logger.error(f"Webhook setup error: {e}")
+        
+        # Запускаем фоновый сканер
+        scanner_thread = threading.Thread(target=auto_scanner, daemon=True)
+        scanner_thread.start()
+        
+        # Запускаем Flask
+        port = int(os.environ.get("PORT", 10000))
+        app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    if not init_bot():
-        exit(1)
-
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    main()
