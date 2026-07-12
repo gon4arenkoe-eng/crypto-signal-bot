@@ -1,5 +1,5 @@
 """
-Crypto Signal Bot v7.4 — Исправлен CoinGecko API Key + Rate Limit
+Crypto Signal Bot v7.5 — Отладка токена
 """
 
 import os
@@ -22,36 +22,47 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Environment variables
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
+
+# ОТЛАДКА: проверяем что видит бот
+logger.info(f"🔍 TOKEN length: {len(TOKEN)}")
+logger.info(f"🔍 TOKEN prefix: {TOKEN[:15]}..." if TOKEN else "🔍 TOKEN: EMPTY!")
+logger.info(f"🔍 WEBHOOK_URL: {WEBHOOK_URL}")
+logger.info(f"🔍 COINGECKO_KEY length: {len(COINGECKO_API_KEY)}")
+
+# Проверяем токен через API прямо здесь
+if TOKEN:
+    try:
+        resp = requests.get(f"https://api.telegram.org/bot{TOKEN}/getMe", timeout=10)
+        logger.info(f"🔍 getMe status: {resp.status_code}")
+        logger.info(f"🔍 getMe body: {resp.text[:200]}")
+    except Exception as e:
+        logger.error(f"🔍 getMe error: {e}")
+else:
+    logger.error("🔍 TOKEN is empty!")
 
 # CoinGecko
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
-# Проверяем API ключ
 if COINGECKO_API_KEY:
     HEADERS = {"x-cg-demo-api-key": COINGECKO_API_KEY}
     logger.info(f"✅ CoinGecko API Key активирован: {COINGECKO_API_KEY[:10]}...")
 else:
     HEADERS = {}
-    logger.warning("⚠️ CoinGecko API Key НЕ найден! Будет ограничение 10-30 запросов/мин")
+    logger.warning("⚠️ CoinGecko API Key НЕ найден!")
 
 # Настройки сигналов
 SIGNAL_CONFIG = {
     "stop_loss_pct": 2.5,
     "min_risk_pct": 0.005,
     "atr_multiplier": 2.5,
-    "scan_interval": 600,   # 10 минут
-    "scan_batch_size": 3,   # Только 3 монеты за раз (без ключа)
-    "scan_delay": 20,       # 20 сек между запросами (без ключа)
+    "scan_interval": 600,
+    "scan_batch_size": 10 if COINGECKO_API_KEY else 3,
+    "scan_delay": 2 if COINGECKO_API_KEY else 20,
 }
-
-# Если есть API ключ — можно больше
-if COINGECKO_API_KEY:
-    SIGNAL_CONFIG["scan_batch_size"] = 10
-    SIGNAL_CONFIG["scan_delay"] = 2
 
 SIGNAL_STARS = {
     5: "⭐⭐⭐⭐⭐ МОЩНЫЙ",
@@ -393,7 +404,7 @@ def handle_start(bot, chat_id, user):
     welcome = f"""
 👋 <b>Привет, {user.first_name}!</b>
 
-🤖 <b>Crypto Signal Bot v7.4</b>
+🤖 <b>Crypto Signal Bot v7.5</b>
 Автоматические сигналы на основе технического анализа.
 
 📊 <b>Возможности:</b>
@@ -638,6 +649,8 @@ def process_update(bot, update_json):
         text = update.message.text or ""
         user_id = user.id
         
+        logger.info(f"💬 Processing: {text} from {user_id}")
+        
         if text.startswith("/start"):
             handle_start(bot, chat_id, user)
         elif text.startswith("/signal"):
@@ -660,7 +673,9 @@ def process_update(bot, update_json):
             handle_text_message(bot, chat_id, text, user_id)
             
     except Exception as e:
-        logger.error(f"Error processing update: {e}")
+        logger.error(f"❌ Error processing update: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 # ==================== АВТОСКАНЕР ====================
 def should_send_signal(coin, signal_type, stars):
@@ -820,21 +835,32 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Crypto Signal Bot v7.4 is running!"
+    return "Crypto Signal Bot v7.5 is running!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    logger.info(f"📩 Webhook hit! Method: {request.method}")
     try:
         json_data = request.get_json(force=True)
-        process_update(bot, json_data)
+        logger.info(f"📨 Data: {json.dumps(json_data, ensure_ascii=False)[:300]}")
+        
+        if not json_data:
+            logger.error("❌ Empty JSON")
+            return jsonify({"ok": False, "error": "No JSON"}), 400
+        
+        # Обрабатываем в потоке, чтобы не блокировать ответ
+        threading.Thread(target=process_update, args=(bot, json_data), daemon=True).start()
+        
         return jsonify({"ok": True})
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"❌ Webhook error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "version": "7.4"})
+    return jsonify({"status": "ok", "version": "7.5"})
 
 # ==================== MAIN ====================
 def setup_webhook():
