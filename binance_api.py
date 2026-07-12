@@ -48,7 +48,7 @@ SYMBOL_MAP = {
     "pepe": "PEPE", "bonk": "BONK", "floki": "FLOKI",
     "dogwifhat": "WIF", "book-of-meme": "BOME", "popcat": "POPCAT",
     "mew": "MEW", "cat-in-a-dogs-world": "MEW",
-    "mog-coin": "MOG", "brett": "BRETT", "andrew-tate": "DADDY",
+    "mog-coin": "MOG", "brett": "BRETT",
     "gigachad": "GIGA", "maga": "TRUMP", "pepe-unchained": "PEPU",
     "turbo": "TURBO", "pepecoin": "PEPECOIN",
 }
@@ -70,14 +70,14 @@ def _cc_get(endpoint, params=None):
                 return None
             return data
         elif resp.status_code == 429:
-            logger.warning("⚠️ CryptoCompare rate limit, sleeping 2s...")
+            logger.warning("CryptoCompare rate limit, sleeping 2s...")
             time.sleep(2)
             return None
         else:
             logger.error(f"CryptoCompare HTTP {resp.status_code}: {resp.text[:200]}")
             return None
     except requests.exceptions.Timeout:
-        logger.warning("⏱️ CryptoCompare timeout")
+        logger.warning("CryptoCompare timeout")
         return None
     except Exception as e:
         logger.error(f"CryptoCompare request error: {e}")
@@ -202,7 +202,7 @@ def analyze_binance_signal(symbol="BTCUSDT", interval="1h"):
 
     Args:
         symbol: "BTCUSDT" или coin_id типа "bitcoin"
-        interval: "1h" (hour), "1d" (day), "1m" (minute) — маппится на CryptoCompare
+        interval: "1h" (hour), "1d" (day), "1m" (minute) -- маппится на CryptoCompare
 
     Returns:
         dict или None
@@ -222,7 +222,6 @@ def analyze_binance_signal(symbol="BTCUSDT", interval="1h"):
     closes = [float(k["close"]) for k in ohlcv]
     highs = [float(k["high"]) for k in ohlcv]
     lows = [float(k["low"]) for k in ohlcv]
-    volumes_from = [float(k.get("volumefrom", 0)) for k in ohlcv]
     volumes_to = [float(k.get("volumeto", 0)) for k in ohlcv]
 
     ema8 = calculate_ema(closes, 8)
@@ -230,7 +229,6 @@ def analyze_binance_signal(symbol="BTCUSDT", interval="1h"):
     rsi = calculate_rsi(closes)
 
     current_close = closes[-1]
-    prev_close = closes[-2]
 
     # EMA Crossover сигналы
     ema_cross_up = (ema8[-2] <= ema50[-2] and ema8[-1] > ema50[-1])
@@ -323,7 +321,7 @@ def analyze_binance_signal(symbol="BTCUSDT", interval="1h"):
 # Алиасы для совместимости с bot.py (который импортирует binance_api)
 
 def binance_get_klines(symbol="BTCUSDT", interval="1h", limit=100):
-    """Алиас для cc_get_ohlcv — совместимость с bot.py"""
+    """Алиас для cc_get_ohlcv -- совместимость с bot.py"""
     cc_interval = "hour"
     if interval in ["1d", "1D", "day"]:
         cc_interval = "day"
@@ -331,21 +329,20 @@ def binance_get_klines(symbol="BTCUSDT", interval="1h", limit=100):
         cc_interval = "minute"
     data = cc_get_ohlcv(symbol, cc_interval, limit)
     if data:
-        # Конвертируем в формат, похожий на Binance klines
         return [
             [
-                k["time"] * 1000,  # open_time (ms)
+                k["time"] * 1000,
                 str(k["open"]),
                 str(k["high"]),
                 str(k["low"]),
                 str(k["close"]),
                 str(k.get("volumefrom", 0)),
-                (k["time"] + 3600) * 1000,  # close_time (примерно)
+                (k["time"] + 3600) * 1000,
                 str(k.get("volumeto", 0)),
-                0,  # trades
-                "0",  # taker_buy_base
-                "0",  # taker_buy_quote
-                "0",  # ignore
+                0,
+                "0",
+                "0",
+                "0",
             ]
             for k in data
         ]
@@ -353,7 +350,7 @@ def binance_get_klines(symbol="BTCUSDT", interval="1h", limit=100):
 
 
 def binance_get_ticker_24h(symbol="BTCUSDT"):
-    """Алиас для cc_get_ticker_24h — совместимость с bot.py"""
+    """Алиас для cc_get_ticker_24h -- совместимость с bot.py"""
     fsym = _resolve_symbol(symbol)
     ticker = cc_get_ticker_24h(fsym)
     if ticker:
@@ -371,63 +368,58 @@ def binance_get_ticker_24h(symbol="BTCUSDT"):
 
 
 def binance_get_price(symbol="BTCUSDT"):
-    """Алиас для cc_get_price — совместимость с bot.py"""
+    """Алиас для cc_get_price -- совместимость с bot.py"""
     return cc_get_price(symbol)
 
 
 def test_binance_connection():
     """Тест подключения к CryptoCompare API"""
     logger.info("=" * 60)
-    logger.info("🔌 ТЕСТ ПОДКЛЮЧЕНИЯ К CRYPTOCOMPARE API")
+    logger.info("ТЕСТ ПОДКЛЮЧЕНИЯ К CRYPTOCOMPARE API")
     logger.info("=" * 60)
 
-    # 1. Проверка серверного времени (через OHLCV)
-    logger.info("1️⃣ Проверка API...")
+    logger.info("1. Проверка API...")
     ohlcv = cc_get_ohlcv("BTC", "hour", 1)
     if ohlcv:
         last_time = datetime.fromtimestamp(ohlcv[-1]["time"])
-        logger.info(f"   ✅ Успех! Последняя свеча: {last_time}")
+        logger.info(f"   Успех! Последняя свеча: {last_time}")
     else:
-        logger.error("   ❌ Ошибка подключения")
+        logger.error("   Ошибка подключения")
         return
 
-    # 2. Свечи BTC
-    logger.info("2️⃣ Получение свечей BTC (1ч)...")
+    logger.info("2. Получение свечей BTC (1ч)...")
     ohlcv = cc_get_ohlcv("BTC", "hour", 5)
     if ohlcv:
-        logger.info(f"   ✅ Получено {len(ohlcv)} свечей")
+        logger.info(f"   Получено {len(ohlcv)} свечей")
         logger.info(f"   Последняя: Open=${ohlcv[-1]['open']:,.2f}, Close=${ohlcv[-1]['close']:,.2f}")
     else:
-        logger.error("   ❌ Ошибка")
+        logger.error("   Ошибка")
 
-    # 3. Текущая цена
-    logger.info("3️⃣ Получение текущей цены BTC...")
+    logger.info("3. Получение текущей цены BTC...")
     price = cc_get_price("BTC")
     if price:
-        logger.info(f"   ✅ BTC: ${price:,.2f}")
+        logger.info(f"   BTC: ${price:,.2f}")
     else:
-        logger.error("   ❌ Ошибка")
+        logger.error("   Ошибка")
 
-    # 4. Статистика 24ч
-    logger.info("4️⃣ Получение статистики 24ч...")
+    logger.info("4. Получение статистики 24ч...")
     ticker = cc_get_ticker_24h("BTC")
     if ticker:
-        logger.info(f"   ✅ Изменение 24ч: {ticker.get('CHANGEPCT24HOUR', 0):+.2f}%")
+        logger.info(f"   Изменение 24ч: {ticker.get('CHANGEPCT24HOUR', 0):+.2f}%")
     else:
-        logger.error("   ❌ Ошибка")
+        logger.error("   Ошибка")
 
-    # 5. Анализ сигнала
-    logger.info("5️⃣ Анализ сигнала BTC...")
+    logger.info("5. Анализ сигнала BTC...")
     signal = analyze_binance_signal("BTCUSDT", "1h")
     if signal:
-        logger.info(f"   ✅ Сигнал: {signal['signal']} {signal['coin']} @ ${signal['entry']}")
+        logger.info(f"   Сигнал: {signal['signal']} {signal['coin']} @ ${signal['entry']}")
         logger.info(f"   RSI: {signal['rsi']}, EMA8: {signal['ema8']}, EMA50: {signal['ema50']}")
     else:
-        logger.info("   ⚠️ Нет сигнала")
+        logger.info("   Нет сигнала")
 
     logger.info("=" * 60)
 
 
-if __name__ == "__main__:
+if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     test_binance_connection()
