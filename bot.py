@@ -1,6 +1,6 @@
 """
-Crypto Signal Bot v7.1 - CoinGecko Edition
-Исправлена совместимость python-telegram-bot
+Crypto Signal Bot v7.2 — Работает на webhook без Application/Updater
+Использует telegram.Bot напрямую + Flask
 """
 
 import os
@@ -9,16 +9,11 @@ import time
 import logging
 import sqlite3
 import threading
-import asyncio
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import requests
 import telegram
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
 
 # ==================== НАСТРОЙКИ ====================
 logging.basicConfig(
@@ -32,7 +27,6 @@ TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
-USE_POLLING = os.environ.get("USE_POLLING", "false").lower() == "true"
 
 # CoinGecko
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
@@ -46,7 +40,6 @@ SIGNAL_CONFIG = {
     "scan_interval": 600,
 }
 
-# Категории сигналов
 SIGNAL_STARS = {
     5: "⭐⭐⭐⭐⭐ МОЩНЫЙ",
     4: "⭐⭐⭐⭐ Сильный",
@@ -129,7 +122,7 @@ def cg_get(endpoint, params=None):
         return None
 
 def get_coin_data(coin_id="bitcoin"):
-    data = cg_get(f"/coins/{coin_id}", {
+    return cg_get(f"/coins/{coin_id}", {
         "localization": "false",
         "tickers": "false",
         "market_data": "true",
@@ -137,14 +130,12 @@ def get_coin_data(coin_id="bitcoin"):
         "developer_data": "false",
         "sparkline": "false"
     })
-    return data
 
 def get_market_chart(coin_id="bitcoin", days=30):
-    data = cg_get(f"/coins/{coin_id}/market_chart", {
+    return cg_get(f"/coins/{coin_id}/market_chart", {
         "vs_currency": "usd",
         "days": str(days)
     })
-    return data
 
 def get_top_coins(limit=100):
     data = cg_get("/coins/markets", {
@@ -290,7 +281,7 @@ def analyze_coin(coin_id="bitcoin"):
         return None
     
     prices = [p[1] for p in chart_data["prices"]]
-    highs = prices  # Упрощение
+    highs = prices
     lows = prices
     
     if len(prices) < 20:
@@ -361,7 +352,6 @@ def format_signal(signal):
 💵 <b>Цена:</b> ${signal['price']:,.8f}
 """
 
-# ==================== КЛАВИАТУРА ====================
 def get_main_menu():
     keyboard = [
         ["📈 Сигнал", "📊 Обзор рынка"],
@@ -371,11 +361,10 @@ def get_main_menu():
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# ==================== ОБРАБОТЧИКИ ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+def handle_start(bot, chat_id, user):
+    """Обработка /start"""
+    # Сохраняем пользователя
     conn = get_db()
     c = conn.cursor()
     c.execute('''INSERT OR REPLACE INTO users 
@@ -388,7 +377,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome = f"""
 👋 <b>Привет, {user.first_name}!</b>
 
-🤖 <b>Crypto Signal Bot v7.1</b>
+🤖 <b>Crypto Signal Bot v7.2</b>
 Автоматические сигналы на основе технического анализа.
 
 📊 <b>Возможности:</b>
@@ -399,15 +388,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Выбери действие в меню ниже 👇
 """
-    await update.message.reply_text(welcome, parse_mode="HTML", reply_markup=get_main_menu())
+    bot.send_message(chat_id=chat_id, text=welcome, parse_mode="HTML", reply_markup=get_main_menu())
 
-async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
+def handle_signal(bot, chat_id, args):
+    """Обработка /signal"""
     if not args:
-        await update.message.reply_text(
-            "❌ Укажи монету: /signal BTC\nИли выбери из топа: /top",
-            reply_markup=get_main_menu()
-        )
+        bot.send_message(chat_id=chat_id, text="❌ Укажи монету: /signal BTC\nИли выбери из /top", reply_markup=get_main_menu())
         return
     
     coin = args[0].lower()
@@ -419,12 +405,12 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     coin_id = coin_map.get(coin, coin)
     
-    await update.message.reply_text(f"🔍 Анализирую {coin.upper()}...", reply_markup=get_main_menu())
+    bot.send_message(chat_id=chat_id, text=f"🔍 Анализирую {coin.upper()}...", reply_markup=get_main_menu())
     
     signal = analyze_coin(coin_id)
     if signal:
         msg = format_signal(signal)
-        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_menu())
+        bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML", reply_markup=get_main_menu())
         
         conn = get_db()
         c = conn.cursor()
@@ -442,13 +428,11 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         conn.close()
     else:
-        await update.message.reply_text(
-            f"⚠️ Нет сигнала для {coin.upper()}\nРынок нейтральный.",
-            reply_markup=get_main_menu()
-        )
+        bot.send_message(chat_id=chat_id, text=f"⚠️ Нет сигнала для {coin.upper()}\nРынок нейтральный.", reply_markup=get_main_menu())
 
-async def scanner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Сканирую рынок...", reply_markup=get_main_menu())
+def handle_scanner(bot, chat_id):
+    """Обработка /scanner"""
+    bot.send_message(chat_id=chat_id, text="🔍 Сканирую рынок...", reply_markup=get_main_menu())
     
     top_coins = get_top_coins(50)
     signals_found = []
@@ -468,10 +452,7 @@ async def scanner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     signals_found.sort(key=lambda x: x["stars"], reverse=True)
     
     if not signals_found:
-        await update.message.reply_text(
-            "📊 Нет активных сигналов.\nРынок в боковике.",
-            reply_markup=get_main_menu()
-        )
+        bot.send_message(chat_id=chat_id, text="📊 Нет активных сигналов.\nРынок в боковике.", reply_markup=get_main_menu())
         return
     
     message = f"🎯 <b>АКТИВНЫЕ СИГНАЛЫ</b> ({len(signals_found)})\n\n"
@@ -482,10 +463,11 @@ async def scanner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += f"   Вход: ${sig['entry']:,.6f} | SL: ${sig['stop_loss']:,.6f} | TP1: ${sig['take_profit_1']:,.6f}\n"
         message += f"   RSI: {sig['rsi']} | 24ч: {sig['change_24h']}%\n\n"
     
-    await update.message.reply_text(message, parse_mode="HTML", reply_markup=get_main_menu())
+    bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML", reply_markup=get_main_menu())
 
-async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📊 Загружаю топ...", reply_markup=get_main_menu())
+def handle_top(bot, chat_id):
+    """Обработка /top"""
+    bot.send_message(chat_id=chat_id, text="📊 Загружаю топ...", reply_markup=get_main_menu())
     
     coins = get_top_coins(10)
     message = "🔝 <b>ТОП-10 КРИПТО</b>\n\n"
@@ -497,15 +479,12 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         emoji = "🟢" if change >= 0 else "🔴"
         message += f"{i}. <b>{symbol}</b> — ${price:,.2f} {emoji} {change:+.2f}%\n"
     
-    await update.message.reply_text(message, parse_mode="HTML", reply_markup=get_main_menu())
+    bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML", reply_markup=get_main_menu())
 
-async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
+def handle_alert(bot, chat_id, user_id, args):
+    """Обработка /alert"""
     if len(args) < 3:
-        await update.message.reply_text(
-            "❌ Формат: /alert BTC above 70000\nили: /alert ETH below 2000",
-            reply_markup=get_main_menu()
-        )
+        bot.send_message(chat_id=chat_id, text="❌ Формат: /alert BTC above 70000\nили: /alert ETH below 2000", reply_markup=get_main_menu())
         return
     
     coin = args[0].upper()
@@ -513,17 +492,12 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         target = float(args[2])
     except ValueError:
-        await update.message.reply_text("❌ Цена должна быть числом", reply_markup=get_main_menu())
+        bot.send_message(chat_id=chat_id, text="❌ Цена должна быть числом", reply_markup=get_main_menu())
         return
     
     if condition not in ["above", "below"]:
-        await update.message.reply_text(
-            "❌ Условие: above (выше) или below (ниже)",
-            reply_markup=get_main_menu()
-        )
+        bot.send_message(chat_id=chat_id, text="❌ Условие: above (выше) или below (ниже)", reply_markup=get_main_menu())
         return
-    
-    user_id = update.effective_user.id
     
     conn = get_db()
     c = conn.cursor()
@@ -534,15 +508,10 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     
     emoji = "⬆️" if condition == "above" else "⬇️"
-    await update.message.reply_text(
-        f"🔔 <b>Алерт установлен!</b>\n\n{coin} {emoji} {condition} ${target:,.2f}",
-        parse_mode="HTML",
-        reply_markup=get_main_menu()
-    )
+    bot.send_message(chat_id=chat_id, text=f"🔔 <b>Алерт установлен!</b>\n\n{coin} {emoji} {condition} ${target:,.2f}", parse_mode="HTML", reply_markup=get_main_menu())
 
-async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
+def handle_alerts(bot, chat_id, user_id):
+    """Обработка /alerts"""
     conn = get_db()
     c = conn.cursor()
     c.execute('''SELECT coin, condition, target_price, triggered 
@@ -552,10 +521,7 @@ async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     
     if not alerts:
-        await update.message.reply_text(
-            "🔕 У тебя нет активных алертов.\nУстанови: /alert BTC above 70000",
-            reply_markup=get_main_menu()
-        )
+        bot.send_message(chat_id=chat_id, text="🔕 У тебя нет активных алертов.\nУстанови: /alert BTC above 70000", reply_markup=get_main_menu())
         return
     
     message = "🔔 <b>ТВОИ АЛЕРТЫ</b>\n\n"
@@ -564,9 +530,10 @@ async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         emoji = "⬆️" if condition == "above" else "⬇️"
         message += f"{status} {coin} {emoji} {condition} ${price:,.2f}\n"
     
-    await update.message.reply_text(message, parse_mode="HTML", reply_markup=get_main_menu())
+    bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML", reply_markup=get_main_menu())
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def handle_stats(bot, chat_id):
+    """Обработка /stats"""
     conn = get_db()
     c = conn.cursor()
     
@@ -602,9 +569,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         star_str = "⭐" * stars
         message += f"{emoji} {coin} {star_str} | R:R 1:{rr} | ${entry:,.6f}\n"
     
-    await update.message.reply_text(message, parse_mode="HTML", reply_markup=get_main_menu())
+    bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML", reply_markup=get_main_menu())
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def handle_help(bot, chat_id):
+    """Обработка /help"""
     help_text = """
 📚 <b>ПОМОЩЬ</b>
 
@@ -630,28 +598,62 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • 4-5⭐ — мощные, повторяются
 • 1-3⭐ — отправляются один раз
 """
-    await update.message.reply_text(help_text, parse_mode="HTML", reply_markup=get_main_menu())
+    bot.send_message(chat_id=chat_id, text=help_text, parse_mode="HTML", reply_markup=get_main_menu())
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    
+def handle_text_message(bot, chat_id, text, user_id):
+    """Обработка текстовых кнопок меню"""
     if "Сигнал" in text:
-        await update.message.reply_text(
-            "Введи: /signal BTC\nили выбери из /top",
-            reply_markup=get_main_menu()
-        )
+        bot.send_message(chat_id=chat_id, text="Введи: /signal BTC\nили выбери из /top", reply_markup=get_main_menu())
     elif "Обзор" in text or "Сканер" in text:
-        await scanner_command(update, context)
+        handle_scanner(bot, chat_id)
     elif "Топ" in text:
-        await top_command(update, context)
+        handle_top(bot, chat_id)
     elif "Алерты" in text:
-        await alerts_command(update, context)
+        handle_alerts(bot, chat_id, user_id)
     elif "Статистика" in text:
-        await stats_command(update, context)
+        handle_stats(bot, chat_id)
     elif "Помощь" in text:
-        await help_command(update, context)
+        handle_help(bot, chat_id)
     else:
-        await signal_command(update, context)
+        handle_signal(bot, chat_id, [text.strip()])
+
+def process_update(bot, update_json):
+    """Обработка входящего обновления от Telegram"""
+    try:
+        update = Update.de_json(update_json, bot)
+        
+        if not update.message:
+            return
+        
+        chat_id = update.message.chat_id
+        user = update.message.from_user
+        text = update.message.text or ""
+        user_id = user.id
+        
+        # Парсим команду
+        if text.startswith("/start"):
+            handle_start(bot, chat_id, user)
+        elif text.startswith("/signal"):
+            args = text.split()[1:]
+            handle_signal(bot, chat_id, args)
+        elif text.startswith("/scanner"):
+            handle_scanner(bot, chat_id)
+        elif text.startswith("/top"):
+            handle_top(bot, chat_id)
+        elif text.startswith("/alert"):
+            args = text.split()[1:]
+            handle_alert(bot, chat_id, user_id, args)
+        elif text.startswith("/alerts"):
+            handle_alerts(bot, chat_id, user_id)
+        elif text.startswith("/stats"):
+            handle_stats(bot, chat_id)
+        elif text.startswith("/help"):
+            handle_help(bot, chat_id)
+        else:
+            handle_text_message(bot, chat_id, text, user_id)
+            
+    except Exception as e:
+        logger.error(f"Error processing update: {e}")
 
 # ==================== АВТОСКАНЕР ====================
 def should_send_signal(coin, signal_type, stars):
@@ -799,21 +801,18 @@ def auto_scanner():
         
         time.sleep(SIGNAL_CONFIG["scan_interval"])
 
-# ==================== FLASK + WEBHOOK ====================
+# ==================== FLASK ====================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Crypto Signal Bot v7.1 is running!"
+    return "Crypto Signal Bot v7.2 is running!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
         json_data = request.get_json(force=True)
-        update = Update.de_json(json_data, bot)
-        
-        # Обрабатываем асинхронно
-        asyncio.create_task(application.process_update(update))
+        process_update(bot, json_data)
         return jsonify({"ok": True})
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -821,11 +820,11 @@ def webhook():
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "version": "7.1"})
+    return jsonify({"status": "ok", "version": "7.2"})
 
 # ==================== MAIN ====================
 def main():
-    global application, bot
+    global bot
     
     # Проверка токена
     if not TOKEN:
@@ -834,47 +833,29 @@ def main():
     
     logger.info(f"✅ Токен получен: {TOKEN[:10]}...")
     
-    # Инициализация БД
+    # Инициализация
     init_db()
     
-    # Создаём приложение БЕЗ Updater (только для обработки)
-    application = Application.builder().token(TOKEN).build()
-    bot = application.bot
+    # Создаём бота напрямую (без Application/Updater)
+    bot = telegram.Bot(TOKEN)
     
-    # Регистрируем обработчики
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("signal", signal_command))
-    application.add_handler(CommandHandler("scanner", scanner_command))
-    application.add_handler(CommandHandler("top", top_command))
-    application.add_handler(CommandHandler("alert", alert_command))
-    application.add_handler(CommandHandler("alerts", alerts_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # Устанавливаем webhook
+    webhook_url = f"{WEBHOOK_URL}/webhook"
+    try:
+        bot.delete_webhook()
+        time.sleep(1)
+        bot.set_webhook(url=webhook_url)
+        logger.info(f"✅ Webhook установлен: {webhook_url}")
+    except Exception as e:
+        logger.error(f"Webhook setup error: {e}")
     
-    if USE_POLLING:
-        logger.info("Starting polling...")
-        application.run_polling()
-    else:
-        logger.info("Starting webhook...")
-        
-        # Устанавливаем webhook
-        webhook_url = f"{WEBHOOK_URL}/webhook"
-        try:
-            bot.delete_webhook()
-            time.sleep(1)
-            bot.set_webhook(url=webhook_url)
-            logger.info(f"Webhook set to {webhook_url}")
-        except Exception as e:
-            logger.error(f"Webhook setup error: {e}")
-        
-        # Запускаем фоновый сканер
-        scanner_thread = threading.Thread(target=auto_scanner, daemon=True)
-        scanner_thread.start()
-        
-        # Запускаем Flask
-        port = int(os.environ.get("PORT", 10000))
-        app.run(host="0.0.0.0", port=port)
+    # Запускаем фоновый сканер
+    scanner_thread = threading.Thread(target=auto_scanner, daemon=True)
+    scanner_thread.start()
+    
+    # Запускаем Flask
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
