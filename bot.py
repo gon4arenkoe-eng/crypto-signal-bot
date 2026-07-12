@@ -1,5 +1,5 @@
 """
-Crypto Signal Bot v7.3 — Исправлены async webhook + CoinGecko rate limit
+Crypto Signal Bot v7.4 — Исправлен CoinGecko API Key + Rate Limit
 """
 
 import os
@@ -8,7 +8,6 @@ import time
 import logging
 import sqlite3
 import threading
-import asyncio
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import requests
@@ -30,17 +29,29 @@ COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
 
 # CoinGecko
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
-HEADERS = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
+
+# Проверяем API ключ
+if COINGECKO_API_KEY:
+    HEADERS = {"x-cg-demo-api-key": COINGECKO_API_KEY}
+    logger.info(f"✅ CoinGecko API Key активирован: {COINGECKO_API_KEY[:10]}...")
+else:
+    HEADERS = {}
+    logger.warning("⚠️ CoinGecko API Key НЕ найден! Будет ограничение 10-30 запросов/мин")
 
 # Настройки сигналов
 SIGNAL_CONFIG = {
     "stop_loss_pct": 2.5,
     "min_risk_pct": 0.005,
     "atr_multiplier": 2.5,
-    "scan_interval": 600,  # 10 минут
-    "scan_batch_size": 5,   # Сканировать 5 монет за раз
-    "scan_delay": 12,       # Задержка между монетами (сек) — для rate limit
+    "scan_interval": 600,   # 10 минут
+    "scan_batch_size": 3,   # Только 3 монеты за раз (без ключа)
+    "scan_delay": 20,       # 20 сек между запросами (без ключа)
 }
+
+# Если есть API ключ — можно больше
+if COINGECKO_API_KEY:
+    SIGNAL_CONFIG["scan_batch_size"] = 10
+    SIGNAL_CONFIG["scan_delay"] = 2
 
 SIGNAL_STARS = {
     5: "⭐⭐⭐⭐⭐ МОЩНЫЙ",
@@ -118,11 +129,11 @@ def cg_get(endpoint, params=None):
         if r.status_code == 200:
             return r.json()
         elif r.status_code == 429:
-            logger.warning("CoinGecko rate limit hit, waiting...")
-            time.sleep(60)  # Ждём минуту при rate limit
+            logger.warning("⚠️ CoinGecko Rate Limit! Ждём 60 сек...")
+            time.sleep(60)
             return None
         else:
-            logger.error(f"CoinGecko error {r.status_code}: {r.text}")
+            logger.error(f"CoinGecko error {r.status_code}: {r.text[:200]}")
             return None
     except Exception as e:
         logger.error(f"CoinGecko request failed: {e}")
@@ -382,7 +393,7 @@ def handle_start(bot, chat_id, user):
     welcome = f"""
 👋 <b>Привет, {user.first_name}!</b>
 
-🤖 <b>Crypto Signal Bot v7.3</b>
+🤖 <b>Crypto Signal Bot v7.4</b>
 Автоматические сигналы на основе технического анализа.
 
 📊 <b>Возможности:</b>
@@ -440,7 +451,7 @@ def handle_scanner(bot, chat_id):
     top_coins = get_top_coins(50)
     signals_found = []
     
-    for coin in top_coins[:20]:
+    for coin in top_coins[:SIGNAL_CONFIG["scan_batch_size"]]:
         coin_id = coin.get("id")
         if not coin_id:
             continue
@@ -448,7 +459,7 @@ def handle_scanner(bot, chat_id):
             signal = analyze_coin(coin_id)
             if signal and signal["stars"] >= 2:
                 signals_found.append(signal)
-            time.sleep(2)  # Задержка между монетами
+            time.sleep(SIGNAL_CONFIG["scan_delay"])
         except Exception as e:
             logger.error(f"Error analyzing {coin_id}: {e}")
             continue
@@ -809,7 +820,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Crypto Signal Bot v7.3 is running!"
+    return "Crypto Signal Bot v7.4 is running!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -823,17 +834,14 @@ def webhook():
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "version": "7.3"})
+    return jsonify({"status": "ok", "version": "7.4"})
 
 # ==================== MAIN ====================
 def setup_webhook():
-    """Настройка webhook через requests вместо async Bot methods"""
     try:
-        # Удаляем старый webhook
         requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook", timeout=10)
         time.sleep(1)
         
-        # Устанавливаем новый
         webhook_url = f"{WEBHOOK_URL}/webhook"
         resp = requests.get(
             f"https://api.telegram.org/bot{TOKEN}/setWebhook",
@@ -859,29 +867,23 @@ def setup_webhook():
 def main():
     global bot
     
-    # Проверка токена
     if not TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
         raise ValueError("TELEGRAM_BOT_TOKEN is not set")
     
     logger.info(f"✅ Токен получен: {TOKEN[:10]}...")
     
-    # Инициализация
     init_db()
     logger.info("✅ База данных инициализирована")
     
-    # Создаём бота
     bot = telegram.Bot(TOKEN)
     
-    # Настраиваем webhook через HTTP API (не async)
     setup_webhook()
     
-    # Запускаем фоновый сканер
     scanner_thread = threading.Thread(target=auto_scanner, daemon=True)
     scanner_thread.start()
     logger.info("✅ Автосканер запущен")
     
-    # Запускаем Flask
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"🚀 Запуск Flask на порту {port}")
     app.run(host="0.0.0.0", port=port)
