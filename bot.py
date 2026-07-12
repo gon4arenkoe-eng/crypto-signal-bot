@@ -1,5 +1,5 @@
 """
-Crypto Signal Bot v7.10 — Исправлено отправка сообщений
+Crypto Signal Bot v8.0 — Полная версия с алертами и статистикой
 """
 
 import os
@@ -69,26 +69,18 @@ def send_message(chat_id, text, parse_mode="HTML", reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     
-    logger.info(f"📤 Отправка в {chat_id}: {text[:50]}...")
-    
     try:
         resp = requests.post(f"{TG_API}/sendMessage", json=payload, timeout=10)
-        logger.info(f"📤 Response status: {resp.status_code}")
-        logger.info(f"📤 Response body: {resp.text[:300]}")
-        
         if resp.status_code == 200:
             data = resp.json()
             if data.get("ok"):
-                logger.info(f"✅ Сообщение отправлено!")
                 return data.get("result")
             else:
-                logger.error(f"❌ TG API error: {data}")
+                logger.error(f"TG API error: {data}")
         else:
-            logger.error(f"❌ TG HTTP {resp.status_code}: {resp.text[:300]}")
+            logger.error(f"TG HTTP {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        logger.error(f"❌ send_message exception: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"send_message error: {e}")
     return None
 
 def get_updates(offset=0, limit=100):
@@ -336,12 +328,8 @@ def handle_start(chat_id, user):
     conn.commit()
     conn.close()
     
-    # Сначала без reply_markup для проверки
-    result = send_message(chat_id, f"👋 Привет, {user.get('first_name', 'друг')}!\n\n🤖 Crypto Signal Bot v7.10\n\nВыбери действие 👇")
-    
-    # Если отправилось — отправляем меню отдельным сообщением
-    if result:
-        send_message(chat_id, "Меню:", reply_markup=get_main_menu())
+    send_message(chat_id, f"👋 Привет, {user.get('first_name', 'друг')}!\n\n🤖 Crypto Signal Bot v8.0\n\nВыбери действие 👇")
+    send_message(chat_id, "Меню:", reply_markup=get_main_menu())
 
 def handle_signal(chat_id, args):
     if not args:
@@ -386,12 +374,120 @@ def handle_top(chat_id):
         msg += f"{i}. <b>{c['symbol'].upper()}</b> ${c['current_price']:,.2f} {'🟢' if ch>=0 else '🔴'} {ch:+.1f}%\n"
     send_message(chat_id, msg)
 
+def handle_alert(chat_id, user_id, args):
+    """Установка алерта: /alert BTC above 70000"""
+    if len(args) < 3:
+        send_message(chat_id, "❌ Формат: /alert BTC above 70000\nили: /alert ETH below 2000")
+        return
+    
+    coin = args[0].upper()
+    condition = args[1].lower()
+    try:
+        target = float(args[2])
+    except ValueError:
+        send_message(chat_id, "❌ Цена должна быть числом")
+        return
+    
+    if condition not in ["above", "below"]:
+        send_message(chat_id, "❌ Условие: above (выше) или below (ниже)")
+        return
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''INSERT INTO alerts (user_id, coin, condition, target_price)
+                 VALUES (?, ?, ?, ?)''',
+              (user_id, coin, condition, target))
+    conn.commit()
+    conn.close()
+    
+    emoji = "⬆️" if condition == "above" else "⬇️"
+    send_message(chat_id, f"🔔 <b>Алерт установлен!</b>\n\n{coin} {emoji} {condition} ${target:,.2f}")
+
+def handle_alerts(chat_id, user_id):
+    """Показать мои алерты"""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''SELECT coin, condition, target_price, triggered 
+                 FROM alerts WHERE user_id = ? ORDER BY created_at DESC''',
+              (user_id,))
+    alerts = c.fetchall()
+    conn.close()
+    
+    if not alerts:
+        send_message(chat_id, "🔕 У тебя нет активных алертов.\nУстанови: /alert BTC above 70000")
+        return
+    
+    message = "🔔 <b>ТВОИ АЛЕРТЫ</b>\n\n"
+    for coin, condition, price, triggered in alerts:
+        status = "✅" if triggered else "⏳"
+        emoji = "⬆️" if condition == "above" else "⬇️"
+        message += f"{status} {coin} {emoji} {condition} ${price:,.2f}\n"
+    
+    send_message(chat_id, message)
+
+def handle_stats(chat_id):
+    """Статистика сигналов"""
+    conn = get_db()
+    c = conn.cursor()
+    
+    c.execute('SELECT COUNT(*) FROM signals')
+    total = c.fetchone()[0]
+    
+    c.execute('SELECT COUNT(*) FROM signals WHERE signal_type = "BUY"')
+    buys = c.fetchone()[0]
+    
+    c.execute('SELECT COUNT(*) FROM signals WHERE signal_type = "SELL"')
+    sells = c.fetchone()[0]
+    
+    c.execute('SELECT AVG(stars) FROM signals')
+    avg_stars = c.fetchone()[0] or 0
+    
+    c.execute('''SELECT coin, signal_type, entry, risk_reward, stars, sent_at 
+                 FROM signals ORDER BY sent_at DESC LIMIT 5''')
+    recent = c.fetchall()
+    
+    conn.close()
+    
+    message = f"""
+📈 <b>СТАТИСТИКА СИГНАЛОВ</b>
+
+Всего сигналов: {total}
+🟢 BUY: {buys} | 🔴 SELL: {sells}
+⭐ Средняя сила: {avg_stars:.1f}
+
+<b>Последние сигналы:</b>
+"""
+    for coin, sig_type, entry, rr, stars, date in recent:
+        emoji = "🟢" if sig_type == "BUY" else "🔴"
+        star_str = "⭐" * stars
+        message += f"{emoji} {coin} {star_str} | R:R 1:{rr} | ${entry:,.6f}\n"
+    
+    send_message(chat_id, message)
+
 def handle_help(chat_id):
     send_message(chat_id, """📚 <b>ПОМОЩЬ</b>
+
+<b>Команды:</b>
 /start — начать
-/signal BTC — сигнал
-/scanner — сканер
-/top — топ монет""")
+/signal BTC — сигнал на монету
+/scanner — сканер рынка
+/top — топ-10 монет
+/alert BTC above 70000 — алерт на цену
+/alerts — мои алерты
+/stats — статистика сигналов
+
+<b>Меню:</b>
+📈 Сигнал — быстрый сигнал
+📊 Обзор — обзор рынка
+🔍 Сканер — поиск сигналов
+🔝 Топ — топ-10 монет
+🔔 Алерты — управление алертами
+📈 Статистика — история сигналов
+
+<b>Автосканер:</b>
+Бот проверяет рынок каждые 10 минут и шлёт сигналы:
+• 4-5⭐ — мощные, повторяются
+• 1-3⭐ — отправляются один раз""")
 
 def process_update(update):
     try:
@@ -402,8 +498,9 @@ def process_update(update):
         chat_id = message["chat"]["id"]
         user = message.get("from", {})
         text = message.get("text", "")
+        user_id = user.get("id")
         
-        logger.info(f"💬 [{user.get('id')}] {text[:50]}")
+        logger.info(f"💬 [{user_id}] {text[:50]}")
         
         if text.startswith("/start"):
             handle_start(chat_id, user)
@@ -413,6 +510,12 @@ def process_update(update):
             handle_scanner(chat_id)
         elif text.startswith("/top"):
             handle_top(chat_id)
+        elif text.startswith("/alert"):
+            handle_alert(chat_id, user_id, text.split()[1:])
+        elif text.startswith("/alerts"):
+            handle_alerts(chat_id, user_id)
+        elif text.startswith("/stats"):
+            handle_stats(chat_id)
         elif text.startswith("/help"):
             handle_help(chat_id)
         elif "Сигнал" in text:
@@ -421,6 +524,10 @@ def process_update(update):
             handle_scanner(chat_id)
         elif "Топ" in text:
             handle_top(chat_id)
+        elif "Алерты" in text:
+            handle_alerts(chat_id, user_id)
+        elif "Статистика" in text:
+            handle_stats(chat_id)
         elif "Помощь" in text:
             handle_help(chat_id)
             
@@ -429,21 +536,166 @@ def process_update(update):
         import traceback
         logger.error(traceback.format_exc())
 
+# ==================== ПРОВЕРКА АЛЕРТОВ ====================
+def check_alerts():
+    """Проверить и отправить сработавшие алерты"""
+    conn = get_db()
+    c = conn.cursor()
+    
+    c.execute('''SELECT id, user_id, coin, condition, target_price 
+                 FROM alerts WHERE triggered = 0''')
+    alerts = c.fetchall()
+    
+    for alert_id, user_id, coin, condition, target in alerts:
+        try:
+            # Получаем текущую цену
+            data = get_coin_data(coin.lower())
+            if not data:
+                continue
+            
+            price = data.get("market_data", {}).get("current_price", {}).get("usd", 0)
+            
+            triggered = False
+            if condition == "above" and price >= target:
+                triggered = True
+            elif condition == "below" and price <= target:
+                triggered = True
+            
+            if triggered:
+                c.execute('UPDATE alerts SET triggered = 1 WHERE id = ?', (alert_id,))
+                conn.commit()
+                
+                emoji = "🚀" if condition == "above" else "📉"
+                send_message(
+                    user_id,
+                    f"🔔 <b>АЛЕРТ СРАБОТАЛ!</b>\n\n{emoji} {coin} {condition} ${target:,.2f}\nТекущая цена: ${price:,.2f}"
+                )
+                logger.info(f"🔔 Алерт сработал: {coin} {condition} ${target}")
+        except Exception as e:
+            logger.error(f"Alert check error: {e}")
+    
+    conn.close()
+
 # ==================== АВТОСКАНЕР ====================
+def should_send_signal(coin, signal_type, stars):
+    """Проверить, нужно ли отправлять сигнал"""
+    conn = get_db()
+    c = conn.cursor()
+    
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    c.execute('''SELECT 1 FROM sent_signals 
+                 WHERE coin = ? AND signal_type = ? AND date_text = ?''',
+              (coin, signal_type, today))
+    
+    was_sent = c.fetchone() is not None
+    
+    if stars >= 4:
+        c.execute('''INSERT OR REPLACE INTO sent_signals 
+                     (coin, signal_type, stars, sent_at, date_text)
+                     VALUES (?, ?, ?, ?, ?)''',
+                  (coin, signal_type, stars, datetime.now(), today))
+        conn.commit()
+        conn.close()
+        return True
+    
+    if not was_sent:
+        c.execute('''INSERT INTO sent_signals 
+                     (coin, signal_type, stars, sent_at, date_text)
+                     VALUES (?, ?, ?, ?, ?)''',
+                  (coin, signal_type, stars, datetime.now(), today))
+        conn.commit()
+        conn.close()
+        return True
+    
+    conn.close()
+    return False
+
+def send_signal_to_users(signal):
+    """Отправить сигнал всем пользователям"""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT chat_id, min_stars FROM users WHERE auto_signals = 1')
+    users = c.fetchall()
+    conn.close()
+    
+    msg = format_signal(signal)
+    
+    for chat_id, min_stars in users:
+        if signal["stars"] >= min_stars:
+            try:
+                send_message(chat_id, msg)
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Failed to send to {chat_id}: {e}")
+
 def auto_scanner():
+    """Фоновый сканер рынка"""
     logger.info("Auto-scanner started")
     while True:
         try:
             logger.info("Scanning...")
-            coins = get_top_coins(10)
-            for c in coins[:3]:
-                s = analyze_coin(c.get("id"))
-                if s and s["stars"] >= 4:
-                    logger.info(f"🚨 {s['coin']} {s['signal']} {s['stars']}⭐")
-                time.sleep(3)
-            logger.info("Scan complete")
+            
+            # Проверяем алерты
+            check_alerts()
+            
+            # Сканируем рынок
+            coins = get_top_coins(50)
+            scanned = 0
+            
+            for c in coins[:SIGNAL_CONFIG["scan_batch_size"]]:
+                coin_id = c.get("id")
+                if not coin_id:
+                    continue
+                
+                try:
+                    signal = analyze_coin(coin_id)
+                    if signal and signal["stars"] >= 2:
+                        if should_send_signal(signal["coin"], signal["signal"], signal["stars"]):
+                            # Сохраняем в БД
+                            conn = get_db()
+                            cur = conn.cursor()
+                            try:
+                                cur.execute('''INSERT INTO signals 
+                                             (coin, signal_type, entry, stop_loss, take_profit_1, 
+                                              take_profit_2, take_profit_3, risk_reward, stars, rsi, change_24h)
+                                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                          (signal["coin"], signal["signal"], signal["entry"], 
+                                           signal["stop_loss"], signal["take_profit_1"], signal["take_profit_2"],
+                                           signal["take_profit_3"], signal["risk_reward"], signal["stars"],
+                                           signal["rsi"], signal["change_24h"]))
+                                conn.commit()
+                            except:
+                                pass
+                            conn.close()
+                            
+                            # Отправляем пользователям
+                            send_signal_to_users(signal)
+                            
+                            # Админу о мощных сигналах
+                            if signal["stars"] == 5 and ADMIN_CHAT_ID:
+                                try:
+                                    send_message(
+                                        ADMIN_CHAT_ID,
+                                        f"⚡ <b>МОЩНЫЙ СИГНАЛ 5⭐</b>\n\n{format_signal(signal)}"
+                                    )
+                                except:
+                                    pass
+                            
+                            time.sleep(1)
+                    
+                    scanned += 1
+                    if scanned < SIGNAL_CONFIG["scan_batch_size"]:
+                        time.sleep(SIGNAL_CONFIG["scan_delay"])
+                        
+                except Exception as e:
+                    logger.error(f"Scan error for {coin_id}: {e}")
+                    continue
+            
+            logger.info(f"Scan complete. Scanned: {scanned}")
         except Exception as e:
-            logger.error(f"Scan error: {e}")
+            logger.error(f"Auto-scanner error: {e}")
+        
         time.sleep(SIGNAL_CONFIG["scan_interval"])
 
 # ==================== FLASK ====================
@@ -451,11 +703,11 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot v7.10 running!"
+    return "Bot v8.0 running!"
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "version": "7.10"})
+    return jsonify({"status": "ok", "version": "8.0"})
 
 # ==================== MAIN ====================
 def main():
@@ -468,7 +720,7 @@ def main():
     logger.info("🔄 Удаляем webhook...")
     try:
         resp = requests.get(f"{TG_API}/deleteWebhook?drop_pending_updates=true", timeout=10)
-        logger.info(f"deleteWebhook: {resp.status_code} {resp.text[:100]}")
+        logger.info(f"deleteWebhook: {resp.status_code}")
     except Exception as e:
         logger.error(f"deleteWebhook error: {e}")
     
